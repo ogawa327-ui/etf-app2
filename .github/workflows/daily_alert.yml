@@ -1,0 +1,32 @@
+name: Daily ETF Signal Alert
+
+on:
+  schedule:
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force_notify:
+        description: '強制送信'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          pip install yfinance pandas numpy requests
+      - env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          if [ "${{ github.event.inputs.force_notify }}" = "true" ]; then
+            python notify.py --force
+          else
+            python notify.py
+          fi
