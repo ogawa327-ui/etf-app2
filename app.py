@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 
 # PCワイド画面設定
 st.set_page_config(
-    page_title="米国レバレッジETF 科学的検証・自動最適化ダッシュボード",
+    page_title="米国レバレッジETF 科学的最適化ダッシュボード",
     page_icon="🔬",
     layout="wide"
 )
@@ -26,8 +26,20 @@ def load_all_market_data():
         data[t] = df.dropna()
     return data
 
-with st.spinner("市場データを読み込み中..."):
+@st.cache_data(ttl=3600)
+def get_usdjpy_rate():
+    try:
+        fx = yf.download("USDJPY=X", period="5d", interval="1d", progress=False)
+        if isinstance(fx.columns, pd.MultiIndex):
+            fx.columns = fx.columns.get_level_values(0)
+        rate = float(fx["Close"].iloc[-1])
+        return round(rate, 2)
+    except:
+        return 155.0
+
+with st.spinner("市場データおよび為替レートを読み込み中..."):
     raw_data = load_all_market_data()
+    latest_fx_rate = get_usdjpy_rate()
 
 qqq_raw = raw_data["QQQ"]
 soxx_raw = raw_data["SOXX"]
@@ -37,38 +49,35 @@ soxl_raw = raw_data["SOXL"]
 common_idx = qqq_raw.index.intersection(soxx_raw.index).intersection(tqqq_raw.index).intersection(soxl_raw.index)
 
 # -------------------------------------------------------------
-# 2. セッション状態の初期化（スライダーと連動）
+# 2. セッション状態の初期化
 # -------------------------------------------------------------
 if "tqqq_weight" not in st.session_state:
-    st.session_state["tqqq_weight"] = 70
+    st.session_state["tqqq_weight"] = 85
 if "ema_span" not in st.session_state:
-    st.session_state["ema_span"] = 200
+    st.session_state["ema_span"] = 175
 if "qqq_hv_thresh" not in st.session_state:
-    st.session_state["qqq_hv_thresh"] = 28.0
+    st.session_state["qqq_hv_thresh"] = 24.0
 if "soxx_hv_thresh" not in st.session_state:
     st.session_state["soxx_hv_thresh"] = 40.0
 if "regime2_alloc" not in st.session_state:
-    st.session_state["regime2_alloc"] = 50
+    st.session_state["regime2_alloc"] = 0
 if "opt_msg" not in st.session_state:
     st.session_state["opt_msg"] = None
 
 # -------------------------------------------------------------
-# 3. 高速バックテスト & 自動最適化エンジン
+# 3. 高速バックテスト & 最適化エンジン
 # -------------------------------------------------------------
 tqqq_ret_arr = tqqq_raw.loc[common_idx, "Close"].pct_change().fillna(0).values
 soxl_ret_arr = soxl_raw.loc[common_idx, "Close"].pct_change().fillna(0).values
 q_close_arr = qqq_raw.loc[common_idx, "Close"].values
 s_close_arr = soxx_raw.loc[common_idx, "Close"].values
 
-# 事前ボラティリティ計算
 q_hv_arr = (np.log(qqq_raw.loc[common_idx, "Close"] / qqq_raw.loc[common_idx, "Close"].shift(1)).rolling(20).std() * np.sqrt(252) * 100).fillna(0).values
 s_hv_arr = (np.log(soxx_raw.loc[common_idx, "Close"] / soxx_raw.loc[common_idx, "Close"].shift(1)).rolling(20).std() * np.sqrt(252) * 100).fillna(0).values
 
 def fast_eval(tw, span, q_hvt, s_hvt, r2):
     sw = 1.0 - tw
-    # EMA計算
     alpha = 2.0 / (span + 1.0)
-    # 高速指数平滑化
     q_ema = pd.Series(q_close_arr).ewm(alpha=alpha, adjust=False).mean().values
     s_ema = pd.Series(s_close_arr).ewm(alpha=alpha, adjust=False).mean().values
     
@@ -80,7 +89,6 @@ def fast_eval(tw, span, q_hvt, s_hvt, r2):
     s_warn = (s_close_arr > s_ema) & (s_hv_arr >= s_hvt)
     s_pos = np.where(s_bull, 1.0, np.where(s_warn, r2, 0.0))
     
-    # 翌日執行 (shift 1)
     q_exec = np.zeros_like(q_pos)
     q_exec[1:] = q_pos[:-1]
     s_exec = np.zeros_like(s_pos)
@@ -112,7 +120,6 @@ def fast_eval(tw, span, q_hvt, s_hvt, r2):
     }
 
 def run_grid_search(target_metric="カルマーレシオ"):
-    # 探索パラメータ空間
     t_weights = [1.0, 0.85, 0.70, 0.60, 0.50]
     spans = [150, 175, 200, 220]
     q_hvs = [24.0, 27.0, 30.0]
@@ -153,7 +160,6 @@ if st.sidebar.button("🚀 最適パラメータを自動探索・適用", type=
         target_name = "カルマーレシオ" if "カルマー" in opt_target else "PF"
         best_p, best_m = run_grid_search(target_name)
         
-        # セッションに適用
         st.session_state["tqqq_weight"] = int(best_p[0] * 100)
         st.session_state["ema_span"] = int(best_p[1])
         st.session_state["qqq_hv_thresh"] = float(best_p[2])
@@ -173,7 +179,6 @@ if st.sidebar.button("🚀 最適パラメータを自動探索・適用", type=
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎛️ 手動微調整スライダー")
 
-# スライダー（セッション状態と連動）
 tqqq_w = st.sidebar.slider("① TQQQ 配分比率 (%)", 0, 100, step=5, key="tqqq_weight") / 100.0
 soxl_w = 1.0 - tqqq_w
 st.sidebar.caption(f"配分: TQQQ **{int(tqqq_w*100)}%** ｜ SOXL **{int(soxl_w*100)}%**")
@@ -188,7 +193,6 @@ r2_a = st.sidebar.slider("④ レジーム2（警戒時）の投資比率 (%)", 
 # -------------------------------------------------------------
 res = fast_eval(tqqq_w, ema_s, q_hvt, s_hvt, r2_a)
 
-# ベンチマーク
 bm_strat = (tqqq_w * tqqq_ret_arr) + (soxl_w * soxl_ret_arr)
 bm_cum = np.cumprod(1.0 + bm_strat)
 bm_cagr = bm_cum[-1] ** (1.0 / (len(common_idx)/252.0)) - 1.0
@@ -201,46 +205,19 @@ bm_mdd = np.min((bm_cum - bm_peak) / bm_peak)
 st.title("🛡️ 米国レバレッジETF 科学的最適化ダッシュボード")
 st.caption(f"データ検証期間: 直近5年 ｜ データ更新日: {common_idx[-1].strftime('%Y/%m/%d')}")
 
-# 最適化実行時の完了メッセージ表示
 if st.session_state["opt_msg"]:
     st.success(st.session_state["opt_msg"])
 
 tab1, tab2, tab3 = st.tabs([
-    "🧪 パフォーマンス検証 & 統計指標", 
     "🏛️ 現在のシグナル & 楽天証券発注計算",
+    "🧪 パフォーマンス検証 & 統計指標", 
     "📈 テクニカルチャート"
 ])
 
 # =============================================================
-# TAB 1: パフォーマンス検証
+# TAB 1: 現在シグナル & 発注計算（日本円表示対応）
 # =============================================================
 with tab1:
-    st.subheader("📊 現在設定での統計パフォーマンス")
-    
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("期待年利 (CAGR)", f"{res['CAGR']*100:.1f} %", f"単主持: {bm_cagr*100:.1f}%")
-    m2.metric("年率リスク (Vol)", f"{res['Vol']*100:.1f} %")
-    m3.metric("最大下落率 (MDD)", f"{res['MDD']*100:.1f} %", f"単主持: {bm_mdd*100:.1f}%")
-    m4.metric("プロフィットファクター (PF)", f"{res['PF']:.2f}")
-    m5.metric("カルマーレシオ", f"{res['Calmar']:.2f}")
-    m6.metric("t値 (有意性)", f"{res['t_stat']:.2f}")
-
-    st.markdown("---")
-    
-    # 資産推移 & ドローダウン
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.7, 0.3])
-    fig.add_trace(go.Scatter(x=common_idx, y=res["cum"], name="戦略資産曲線", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=common_idx, y=bm_cum, name="バイ＆ホールド (放置)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=common_idx, y=res["dd"] * 100, name="ドローダウン (%)", fill="tozeroy", line=dict(color="#d62728", width=1)), row=2, col=1)
-    fig.update_layout(height=480, margin=dict(t=20, b=20, l=10, r=10), hovermode="x unified")
-    fig.update_yaxes(title_text="資産倍率", row=1, col=1)
-    fig.update_yaxes(title_text="下落率 (%)", row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True)
-
-# =============================================================
-# TAB 2: 現在シグナル & 発注計算
-# =============================================================
-with tab2:
     st.subheader("🏛️ 現在の判定シグナルと推奨発注")
     q_latest_c = qqq_raw["Close"].iloc[-1]
     s_latest_c = soxx_raw["Close"].iloc[-1]
@@ -277,28 +254,86 @@ with tab2:
         st.plotly_chart(fig_pie, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("💡 楽天証券 寄り付き発注シミュレーター")
-    c_f1, c_f2 = st.columns([1, 2])
-    with c_f1:
-        funds = st.number_input("運用総資金額（米ドル：USD）", min_value=1000, value=30000, step=1000)
-    with c_f2:
-        t_price = tqqq_raw["Close"].iloc[-1]
-        s_price = soxl_raw["Close"].iloc[-1]
-        t_val = funds * tqqq_w * res['q_pos_last']
-        s_val = funds * soxl_w * res['s_pos_last']
-        c_val = funds * c_ratio
-        
-        sim_data = {
-            "銘柄": ["TQQQ", "SOXL", "米ドル現金 / MMF"],
-            "目標金額": [f"${t_val:,.2f}", f"${s_val:,.2f}", f"${c_val:,.2f}"],
-            "目標保有株数": [f"{int(t_val // t_price)} 株", f"{int(s_val // s_price)} 株", "-"],
-            "アクション": [
-                f"{int(t_val // t_price)} 株に調整" if t_val > 0 else "全売却 (0株)",
-                f"{int(s_val // s_price)} 株に調整" if s_val > 0 else "全売却 (0株)",
-                "MMF等で安全待機"
-            ]
-        }
-        st.table(pd.DataFrame(sim_data))
+    st.subheader("💡 楽天証券 寄り付き発注シミュレーター（日本円・米ドル両対応）")
+    
+    # 通貨入力切り替え
+    curr_col1, curr_col2, curr_col3 = st.columns([1.2, 1.5, 1.3])
+    with curr_col1:
+        input_currency = st.radio("入力通貨単位", ["日本円 (万円)", "米ドル (USD)"], horizontal=True)
+    
+    with curr_col2:
+        if input_currency == "日本円 (万円)":
+            funds_jpy_man = st.number_input("運用総資金額（万円）", min_value=10, value=450, step=10)
+        else:
+            funds_usd_in = st.number_input("運用総資金額（米ドル：USD）", min_value=1000, value=29000, step=1000)
+            
+    with curr_col3:
+        fx_rate = st.number_input("適用為替レート (USD/JPY)", value=latest_fx_rate, step=0.5, format="%.2f")
+        st.caption("※リアルタイム自動取得値（手動変更可能）")
+
+    # 資金の相互換算
+    if input_currency == "日本円 (万円)":
+        funds_total_jpy = funds_jpy_man * 10000.0
+        funds_total_usd = funds_total_jpy / fx_rate
+    else:
+        funds_total_usd = float(funds_usd_in)
+        funds_total_jpy = funds_total_usd * fx_rate
+
+    st.info(f"💰 **運用総資産**: **${funds_total_usd:,.2f}** ＝ **約 {funds_total_jpy:,.0f} 円** （{funds_total_jpy/10000:,.1f} 万円）")
+
+    t_price = tqqq_raw["Close"].iloc[-1]
+    s_price = soxl_raw["Close"].iloc[-1]
+    
+    t_val_usd = funds_total_usd * tqqq_w * res['q_pos_last']
+    s_val_usd = funds_total_usd * soxl_w * res['s_pos_last']
+    c_val_usd = funds_total_usd * c_ratio
+    
+    t_val_jpy = t_val_usd * fx_rate
+    s_val_jpy = s_val_usd * fx_rate
+    c_val_jpy = c_val_usd * fx_rate
+    
+    sim_data = {
+        "銘柄": ["TQQQ (NASDAQ 3倍)", "SOXL (半導体 3倍)", "米ドル現金 / MMF"],
+        "目標金額 (USD)": [f"${t_val_usd:,.2f}", f"${s_val_usd:,.2f}", f"${c_val_usd:,.2f}"],
+        "目標金額 (日本円)": [
+            f"約 {t_val_jpy:,.0f} 円 ({t_val_jpy/10000:,.1f}万円)",
+            f"約 {s_val_jpy:,.0f} 円 ({s_val_jpy/10000:,.1f}万円)",
+            f"約 {c_val_jpy:,.0f} 円 ({c_val_jpy/10000:,.1f}万円)"
+        ],
+        "参考株価 (USD)": [f"${t_price:.2f}", f"${s_price:.2f}", "-"],
+        "目標保有株数": [f"{int(t_val_usd // t_price)} 株", f"{int(s_val_usd // s_price)} 株", "-"],
+        "今夜のアクション": [
+            f"保有数を {int(t_val_usd // t_price)} 株に合わせる" if t_val_usd > 0 else "全売却 (0株)",
+            f"保有数を {int(s_val_usd // s_price)} 株に合わせる" if s_val_usd > 0 else "全売却 (0株)",
+            "MMF等で安全待機"
+        ]
+    }
+    st.table(pd.DataFrame(sim_data))
+
+# =============================================================
+# TAB 2: パフォーマンス検証
+# =============================================================
+with tab2:
+    st.subheader("📊 現在設定での統計パフォーマンス")
+    
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("期待年利 (CAGR)", f"{res['CAGR']*100:.1f} %", f"単主持: {bm_cagr*100:.1f}%")
+    m2.metric("年率リスク (Vol)", f"{res['Vol']*100:.1f} %")
+    m3.metric("最大下落率 (MDD)", f"{res['MDD']*100:.1f} %", f"単主持: {bm_mdd*100:.1f}%")
+    m4.metric("プロフィットファクター (PF)", f"{res['PF']:.2f}")
+    m5.metric("カルマーレシオ", f"{res['Calmar']:.2f}")
+    m6.metric("t値 (有意性)", f"{res['t_stat']:.2f}")
+
+    st.markdown("---")
+    
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.7, 0.3])
+    fig.add_trace(go.Scatter(x=common_idx, y=res["cum"], name="戦略資産曲線", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=common_idx, y=bm_cum, name="バイ＆ホールド (放置)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=common_idx, y=res["dd"] * 100, name="ドローダウン (%)", fill="tozeroy", line=dict(color="#d62728", width=1)), row=2, col=1)
+    fig.update_layout(height=480, margin=dict(t=20, b=20, l=10, r=10), hovermode="x unified")
+    fig.update_yaxes(title_text="資産倍率", row=1, col=1)
+    fig.update_yaxes(title_text="下落率 (%)", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
 
 # =============================================================
 # TAB 3: テクニカルチャート
