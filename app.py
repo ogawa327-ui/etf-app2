@@ -7,31 +7,44 @@ from plotly.subplots import make_subplots
 
 # PCワイド画面設定
 st.set_page_config(
-    page_title="米国マルチレバレッジETF 全天候型統合ダッシュボード",
+    page_title="米国マルチレバレッジ 科学的ポートフォリオ最適化システム",
     page_icon="🏛️",
     layout="wide"
 )
 
 # -------------------------------------------------------------
-# 1. アセット定義
+# 1. アセット基本構成
 # -------------------------------------------------------------
-PORTFOLIO_CONFIG = {
-    "TQQQ": {"name": "TQQQ (NASDAQ 3倍)", "underlying": "QQQ", "type": "株式(Tech)", "default_w": 35, "hv_thresh": 28.0},
-    "SPXL": {"name": "SPXL (S&P500 3倍)", "underlying": "SPY", "type": "株式(全体)", "default_w": 25, "hv_thresh": 22.0},
-    "SOXL": {"name": "SOXL (半導体 3倍)", "underlying": "SOXX", "type": "株式(半導体)", "default_w": 15, "hv_thresh": 40.0},
-    "FAS":  {"name": "FAS (金融株 3倍)",   "underlying": "XLF", "type": "株式(金融)", "default_w": 15, "hv_thresh": 25.0},
-    "UGL":  {"name": "UGL (ゴールド 2倍)",  "underlying": "GLD", "type": "コモディティ", "default_w": 10, "hv_thresh": 20.0},
+ASSETS = {
+    "TQQQ": {"name": "TQQQ (NASDAQ 3倍)", "underlying": "QQQ", "type": "ハイテク", "default_ema": 200, "default_hv": 28.0, "hv_grid": [24.0, 28.0, 32.0]},
+    "SPXL": {"name": "SPXL (S&P500 3倍)", "underlying": "SPY", "type": "米国全体", "default_ema": 200, "default_hv": 22.0, "hv_grid": [18.0, 22.0, 26.0]},
+    "SOXL": {"name": "SOXL (半導体 3倍)", "underlying": "SOXX", "type": "半導体",   "default_ema": 200, "default_hv": 40.0, "hv_grid": [35.0, 40.0, 45.0]},
+    "FAS":  {"name": "FAS (金融株 3倍)",   "underlying": "XLF", "type": "金融",     "default_ema": 200, "default_hv": 25.0, "hv_grid": [22.0, 26.0, 30.0]},
+    "UGL":  {"name": "UGL (ゴールド 2倍)",  "underlying": "GLD", "type": "ゴールド", "default_ema": 200, "default_hv": 20.0, "hv_grid": [16.0, 20.0, 24.0]},
 }
 
 # -------------------------------------------------------------
-# 2. データ取得 & キャッシュ
+# 2. サイドバー：データ期間 & 最適化コントローラー
+# -------------------------------------------------------------
+st.sidebar.title("🔬 科学的最適化ラボ")
+
+st.sidebar.markdown("### 📅 データ検証期間の選択")
+selected_period = st.sidebar.selectbox(
+    "バックテスト期間",
+    ["5y (直近5年間：2021〜現在)", "10y (直近10年間：2016〜現在)"],
+    index=0
+)
+period_code = "5y" if "5y" in selected_period else "10y"
+
+# -------------------------------------------------------------
+# 3. データ取得 & 為替レート
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def load_all_market_data():
+def load_market_data(period_str: str):
     all_tickers = ["QQQ", "SPY", "SOXX", "XLF", "GLD", "TQQQ", "SPXL", "SOXL", "FAS", "UGL"]
     data = {}
     for t in all_tickers:
-        df = yf.download(t, period="5y", interval="1d", progress=False)
+        df = yf.download(t, period=period_str, interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         data[t] = df.dropna()
@@ -47,259 +60,378 @@ def get_usdjpy_rate():
     except:
         return 155.0
 
-with st.spinner("5大アセットの市場データおよび為替レートを読み込み中..."):
-    market_data = load_all_market_data()
+with st.spinner(f"市場データ（{selected_period}）を取得・インデックス調整中..."):
+    market_data = load_market_data(period_code)
     latest_fx_rate = get_usdjpy_rate()
 
-# 共通取引日インデックスの抽出
 common_idx = market_data["QQQ"].index
 for k in market_data.keys():
     common_idx = common_idx.intersection(market_data[k].index)
 
 # -------------------------------------------------------------
-# 3. サイドバー：配分比率 & 検証設定
+# 4. セッション状態の初期化
 # -------------------------------------------------------------
-st.sidebar.title("🎛️ ポートフォリオ配分設定")
+for sym in ASSETS.keys():
+    if f"ema_{sym}" not in st.session_state:
+        st.session_state[f"ema_{sym}"] = ASSETS[sym]["default_ema"]
+    if f"hv_{sym}" not in st.session_state:
+        st.session_state[f"hv_{sym}"] = ASSETS[sym]["default_hv"]
 
-st.sidebar.markdown("### ① 資産クラス別 目標配分比率 (%)")
-w_tqqq = st.sidebar.slider("TQQQ (NASDAQ 3倍)", 0, 100, 35, step=5)
-w_spxl = st.sidebar.slider("SPXL (S&P500 3倍)", 0, 100, 25, step=5)
-w_soxl = st.sidebar.slider("SOXL (半導体 3倍)", 0, 100, 15, step=5)
-w_fas  = st.sidebar.slider("FAS (金融株 3倍)", 0, 100, 15, step=5)
-w_ugl  = st.sidebar.slider("UGL (ゴールド 2倍)", 0, 100, 10, step=5)
+if "w_TQQQ" not in st.session_state:
+    st.session_state["w_TQQQ"] = 35
+if "w_SPXL" not in st.session_state:
+    st.session_state["w_SPXL"] = 25
+if "w_SOXL" not in st.session_state:
+    st.session_state["w_SOXL"] = 15
+if "w_FAS" not in st.session_state:
+    st.session_state["w_FAS"] = 15
+if "w_UGL" not in st.session_state:
+    st.session_state["w_UGL"] = 10
+if "regime2_alloc" not in st.session_state:
+    st.session_state["regime2_alloc"] = 50
+if "opt_msg" not in st.session_state:
+    st.session_state["opt_msg"] = None
 
-total_w = w_tqqq + w_spxl + w_soxl + w_fas + w_ugl
-if total_w != 100:
-    st.sidebar.warning(f"⚠️ 合計比率が **{total_w}%** です（100%に調整してください）。")
-    norm_factor = 100.0 / total_w if total_w > 0 else 1.0
+# -------------------------------------------------------------
+# 5. 高速単体バックテスト & 最適化関数
+# -------------------------------------------------------------
+def eval_single_asset(sym, ema_s, hv_t, r2_val):
+    u_sym = ASSETS[sym]["underlying"]
+    c_u = market_data[u_sym].loc[common_idx, "Close"].values
+    c_etf = market_data[sym].loc[common_idx, "Close"].values
+    
+    alpha = 2.0 / (ema_s + 1.0)
+    ema_vals = pd.Series(c_u).ewm(alpha=alpha, adjust=False).mean().values
+    log_ret = np.log(pd.Series(c_u) / pd.Series(c_u).shift(1))
+    hv_vals = (log_ret.rolling(20).std() * np.sqrt(252) * 100).fillna(0).values
+    
+    bull = (c_u > ema_vals) & (hv_vals < hv_t)
+    warn = (c_u > ema_vals) & (hv_vals >= hv_t)
+    pos = np.where(bull, 1.0, np.where(warn, r2_val, 0.0))
+    
+    # 翌日執行
+    exec_pos = np.zeros_like(pos)
+    exec_pos[1:] = pos[:-1]
+    
+    etf_ret = np.zeros_like(c_etf)
+    etf_ret[1:] = (c_etf[1:] - c_etf[:-1]) / c_etf[:-1]
+    
+    strat_ret = exec_pos * etf_ret
+    return strat_ret, pos[-1], ema_vals[-1], hv_vals[-1], c_u[-1], c_etf[-1]
+
+# -------------------------------------------------------------
+# 6. 自動最適化ルーチン（銘柄別パラメータ ＋ 最適配分比率）
+# -------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🤖 科学的自動最適化エンジン")
+opt_target = st.sidebar.selectbox("最適化目標", ["カルマーレシオ最大化（下落抑制＆効率）", "プロフィットファクター最大化（利益損失比）"])
+
+if st.sidebar.button("🚀 銘柄別パラメータ＆最適配分を一括自動算出", type="primary", use_container_width=True):
+    with st.spinner("全銘柄のパラメータ空間＆配分比率をモンテカルロ解析中..."):
+        target_mode = "Calmar" if "カルマー" in opt_target else "PF"
+        r2_now = st.session_state["regime2_alloc"] / 100.0
+        
+        # Step 1: 各銘柄ごとの最適EMAとHVを探索
+        best_ema = {}
+        best_hv = {}
+        single_rets = {}
+        
+        ema_test_candidates = [150, 175, 200, 220]
+        for sym, cfg in ASSETS.items():
+            best_s_score = -9999
+            b_e, b_h = cfg["default_ema"], cfg["default_hv"]
+            for e_candidate in ema_test_candidates:
+                for h_candidate in cfg["hv_grid"]:
+                    s_ret, _, _, _, _, _ = eval_single_asset(sym, e_candidate, h_candidate, r2_now)
+                    cum = np.cumprod(1.0 + s_ret)
+                    yrs = len(s_ret) / 252.0
+                    cagr = cum[-1] ** (1.0 / yrs) - 1.0
+                    peak = np.maximum.accumulate(cum)
+                    dd = (cum - peak) / peak
+                    mdd = np.min(dd)
+                    gains = np.sum(s_ret[s_ret > 0])
+                    losses = np.abs(np.sum(s_ret[s_ret < 0]))
+                    
+                    if target_mode == "Calmar":
+                        score = cagr / abs(mdd) if mdd != 0 else 0
+                    else:
+                        score = gains / losses if losses != 0 else 0
+                        
+                    if score > best_s_score:
+                        best_s_score = score
+                        b_e = e_candidate
+                        b_h = h_candidate
+                        
+            best_ema[sym] = b_e
+            best_hv[sym] = b_h
+            ret_opt, _, _, _, _, _ = eval_single_asset(sym, b_e, b_h, r2_now)
+            single_rets[sym] = ret_opt
+            
+            st.session_state[f"ema_{sym}"] = b_e
+            st.session_state[f"hv_{sym}"] = b_h
+
+        # Step 2: 5銘柄の最適配分比率を探索（ディリクレ・モンテカルロ 4,000試行）
+        ret_matrix = np.column_stack([single_rets[s] for s in ASSETS.keys()])
+        n_days = len(common_idx)
+        yrs = n_days / 252.0
+        
+        np.random.seed(42)
+        n_sim = 4000
+        sim_weights = np.random.dirichlet(np.ones(5), size=n_sim)
+        
+        best_p_score = -9999
+        best_weights = None
+        
+        for w_cand in sim_weights:
+            # 5%刻みに丸め
+            w_round = np.round(w_cand * 20) / 20.0
+            if np.sum(w_round) == 0:
+                continue
+            w_round = w_round / np.sum(w_round)
+            
+            p_ret = np.dot(ret_matrix, w_round)
+            cum = np.cumprod(1.0 + p_ret)
+            cagr = cum[-1] ** (1.0 / yrs) - 1.0
+            peak = np.maximum.accumulate(cum)
+            mdd = np.min((cum - peak) / peak)
+            gains = np.sum(p_ret[p_ret > 0])
+            losses = np.abs(np.sum(p_ret[p_ret < 0]))
+            
+            if target_mode == "Calmar":
+                score = cagr / abs(mdd) if mdd != 0 else 0
+            else:
+                score = gains / losses if losses != 0 else 0
+                
+            if score > best_p_score:
+                best_p_score = score
+                best_weights = w_round
+                
+        # 配分をセッションに反映 (整数%)
+        keys_list = list(ASSETS.keys())
+        w_pct = [int(round(x * 100)) for x in best_weights]
+        diff = 100 - sum(w_pct)
+        w_pct[0] += diff  # 100%になるよう調整
+        
+        for i, sym in enumerate(keys_list):
+            st.session_state[f"w_{sym}"] = max(0, w_pct[i])
+            
+        st.session_state["opt_msg"] = f"""
+        **✅ 科学的最適化が完了しました！（期間: {selected_period} ｜ 目標: {target_mode}最大化）**
+        * **最適配分比率**: TQQQ {st.session_state['w_TQQQ']}% ｜ SPXL {st.session_state['w_SPXL']}% ｜ SOXL {st.session_state['w_SOXL']}% ｜ FAS {st.session_state['w_FAS']}% ｜ UGL {st.session_state['w_UGL']}%
+        * 各銘柄のEMA日数・HV閾値も個別最適値へ更新されました。
+        """
+        st.rerun()
+
+# -------------------------------------------------------------
+# 7. サイドバー：手動パラメータ微調整
+# -------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🎛️ 5銘柄の配分比率（手動調整）")
+w_tqqq = st.sidebar.slider("TQQQ 比率 (%)", 0, 100, step=5, key="w_TQQQ")
+w_spxl = st.sidebar.slider("SPXL 比率 (%)", 0, 100, step=5, key="w_SPXL")
+w_soxl = st.sidebar.slider("SOXL 比率 (%)", 0, 100, step=5, key="w_SOXL")
+w_fas  = st.sidebar.slider("FAS 比率 (%)", 0, 100, step=5, key="w_FAS")
+w_ugl  = st.sidebar.slider("UGL 比率 (%)", 0, 100, step=5, key="w_UGL")
+
+tot_w = w_tqqq + w_spxl + w_soxl + w_fas + w_ugl
+if tot_w != 100:
+    st.sidebar.warning(f"⚠️ 合計比率: **{tot_w}%** （合計100%に調整してください）")
+    norm_f = 100.0 / tot_w if tot_w > 0 else 1.0
 else:
     st.sidebar.success("✅ 合計比率: **100%**")
-    norm_factor = 1.0
+    norm_f = 1.0
 
-# 正規化ウェイト (合計1.0)
-weights = {
-    "TQQQ": (w_tqqq * norm_factor) / 100.0,
-    "SPXL": (w_spxl * norm_factor) / 100.0,
-    "SOXL": (w_soxl * norm_factor) / 100.0,
-    "FAS":  (w_fas * norm_factor) / 100.0,
-    "UGL":  (w_ugl * norm_factor) / 100.0,
+user_weights = {
+    "TQQQ": (w_tqqq * norm_f) / 100.0,
+    "SPXL": (w_spxl * norm_f) / 100.0,
+    "SOXL": (w_soxl * norm_f) / 100.0,
+    "FAS":  (w_fas * norm_f) / 100.0,
+    "UGL":  (w_ugl * norm_f) / 100.0,
 }
 
+with st.sidebar.expander("🛠️ 銘柄別パラメータ個別調整"):
+    for sym in ASSETS.keys():
+        st.markdown(f"**{sym} ({ASSETS[sym]['underlying']}基準)**")
+        st.slider(f"{sym} EMA日数", 100, 250, step=5, key=f"ema_{sym}")
+        st.slider(f"{sym} HV閾値(%)", 15.0, 50.0, step=1.0, key=f"hv_{sym}")
+
 st.sidebar.markdown("---")
-st.sidebar.markdown("### ② 戦略ロジック設定")
-ema_span = st.sidebar.slider("移動平均日数 (EMA)", 100, 250, 200, step=10)
-regime2_alloc = st.sidebar.slider("レジーム2 (波乱警戒時) の保有比率 (%)", 0, 100, 50, step=10) / 100.0
+r2_input = st.sidebar.slider("レジーム2 (警戒時) の保有比率 (%)", 0, 100, step=10, key="regime2_alloc") / 100.0
 
 # -------------------------------------------------------------
-# 4. 指標計算 & レジーム判定
+# 8. ポートフォリオ統合計算
 # -------------------------------------------------------------
-asset_signals = {}
-strat_daily_rets = pd.Series(0.0, index=common_idx)
-bm_daily_rets = pd.Series(0.0, index=common_idx)
+p_strat_ret = np.zeros(len(common_idx))
+p_bm_ret = np.zeros(len(common_idx))
+signals_now = {}
 
-for sym, cfg in PORTFOLIO_CONFIG.items():
-    u_sym = cfg["underlying"]
-    df_u = market_data[u_sym].loc[common_idx].copy()
-    df_etf = market_data[sym].loc[common_idx].copy()
+for sym, cfg in ASSETS.items():
+    s_ret, p_pos, p_ema, p_hv, u_c, etf_c = eval_single_asset(
+        sym, st.session_state[f"ema_{sym}"], st.session_state[f"hv_{sym}"], r2_input
+    )
+    w = user_weights[sym]
+    p_strat_ret += w * s_ret
     
-    # 指標計算
-    alpha = 2.0 / (ema_span + 1.0)
-    ema_series = df_u["Close"].ewm(alpha=alpha, adjust=False).mean()
-    hv_series = (np.log(df_u["Close"] / df_u["Close"].shift(1)).rolling(20).std() * np.sqrt(252) * 100).fillna(0)
+    # ベンチマーク
+    etf_arr = market_data[sym].loc[common_idx, "Close"].values
+    raw_etf_ret = np.zeros_like(etf_arr)
+    raw_etf_ret[1:] = (etf_arr[1:] - etf_arr[:-1]) / etf_arr[:-1]
+    p_bm_ret += w * raw_etf_ret
     
-    # レジーム判定 (1.0 / r2 / 0.0)
-    cond_bull = (df_u["Close"] > ema_series) & (hv_series < cfg["hv_thresh"])
-    cond_warn = (df_u["Close"] > ema_series) & (hv_series >= cfg["hv_thresh"])
-    pos_series = np.where(cond_bull, 1.0, np.where(cond_warn, regime2_alloc, 0.0))
-    
-    # 翌日執行 (shift 1)
-    exec_pos = pd.Series(pos_series, index=common_idx).shift(1).fillna(0)
-    etf_ret = df_etf["Close"].pct_change().fillna(0)
-    
-    w = weights[sym]
-    strat_daily_rets += w * exec_pos * etf_ret
-    bm_daily_rets += w * etf_ret
-    
-    # 最新値の保存
-    last_c = df_u["Close"].iloc[-1]
-    last_ema = ema_series.iloc[-1]
-    last_hv = hv_series.iloc[-1]
-    last_pos = pos_series[-1]
-    
-    if last_pos == 1.0:
-        reg_name, reg_icon = "強気巡航", "🟢"
-    elif last_pos > 0.0:
-        reg_name, reg_icon = "波乱警戒", "🟡"
-    else:
-        reg_name, reg_icon = "弱気防衛", "🔴"
-        
-    asset_signals[sym] = {
-        "name": cfg["name"],
-        "underlying": u_sym,
-        "u_close": last_c,
-        "u_prev": df_u["Close"].iloc[-2],
-        "ema": last_ema,
-        "hv": last_hv,
-        "thresh": cfg["hv_thresh"],
-        "pos": last_pos,
-        "reg_name": reg_name,
-        "reg_icon": reg_icon,
-        "etf_price": df_etf["Close"].iloc[-1]
+    signals_now[sym] = {
+        "pos": p_pos, "ema": p_ema, "hv": p_hv, "u_close": u_c, "etf_price": etf_c,
+        "underlying": cfg["underlying"], "name": cfg["name"], "type": cfg["type"],
+        "ema_param": st.session_state[f"ema_{sym}"], "hv_param": st.session_state[f"hv_{sym}"]
     }
 
-# -------------------------------------------------------------
-# 5. バックテスト統計指標計算
-# -------------------------------------------------------------
-equity_strat = (1.0 + strat_daily_rets).cumprod()
-equity_bm = (1.0 + bm_daily_rets).cumprod()
+# 統合パフォーマンス指標
+cum_strat = np.cumprod(1.0 + p_strat_ret)
+cum_bm = np.cumprod(1.0 + p_bm_ret)
 
 n_days = len(common_idx)
 yrs = n_days / 252.0
 
-cagr_strat = equity_strat.iloc[-1] ** (1.0 / yrs) - 1.0
-cagr_bm = equity_bm.iloc[-1] ** (1.0 / yrs) - 1.0
+cagr_strat = cum_strat[-1] ** (1.0 / yrs) - 1.0
+cagr_bm = cum_bm[-1] ** (1.0 / yrs) - 1.0
 
-vol_strat = strat_daily_rets.std() * np.sqrt(252)
-vol_bm = bm_daily_rets.std() * np.sqrt(252)
+vol_strat = np.std(p_strat_ret) * np.sqrt(252)
+vol_bm = np.std(p_bm_ret) * np.sqrt(252)
 
-peak_strat = equity_strat.cummax()
-dd_strat = (equity_strat - peak_strat) / peak_strat
-mdd_strat = dd_strat.min()
+peak_s = np.maximum.accumulate(cum_strat)
+dd_s = (cum_strat - peak_s) / peak_s
+mdd_strat = np.min(dd_s)
 
-peak_bm = equity_bm.cummax()
-dd_bm = (equity_bm - peak_bm) / peak_bm
-mdd_bm = dd_bm.min()
+peak_b = np.maximum.accumulate(cum_bm)
+mdd_bm = np.min((cum_bm - peak_b) / peak_b)
 
 calmar_strat = cagr_strat / abs(mdd_strat) if mdd_strat != 0 else 0
-gains = strat_daily_rets[strat_daily_rets > 0].sum()
-losses = abs(strat_daily_rets[strat_daily_rets < 0].sum())
-pf_strat = gains / losses if losses != 0 else 0
-t_stat_strat = (strat_daily_rets.mean() / (strat_daily_rets.std() / np.sqrt(n_days))) if strat_daily_rets.std() != 0 else 0
+gains_s = np.sum(p_strat_ret[p_strat_ret > 0])
+losses_s = np.abs(np.sum(p_strat_ret[p_strat_ret < 0]))
+pf_strat = gains_s / losses_s if losses_s != 0 else 0
+t_stat_strat = (np.mean(p_strat_ret) / (np.std(p_strat_ret) / np.sqrt(n_days))) if np.std(p_strat_ret) != 0 else 0
+active_days = np.sum(p_strat_ret != 0)
+win_rate = (np.sum(p_strat_ret > 0) / active_days * 100) if active_days > 0 else 0
 
 # -------------------------------------------------------------
-# 6. メイン画面レイアウト
+# 9. メイン画面レイアウト
 # -------------------------------------------------------------
-st.title("🏛️ 米国マルチレバレッジ 全天候型統合ダッシュボード")
-st.caption(f"対象銘柄: TQQQ / SPXL / SOXL / FAS / UGL ｜ 判定更新基準日: {common_idx[-1].strftime('%Y/%m/%d')}")
+st.title("🏛️ 米国マルチレバレッジ 全天候型最適化ダッシュボード")
+st.caption(f"検証データ期間: **{selected_period}** （{common_idx[0].strftime('%Y/%m/%d')} 〜 {common_idx[-1].strftime('%Y/%m/%d')} ｜ 計 {n_days} 営業日）")
+
+if st.session_state["opt_msg"]:
+    st.success(st.session_state["opt_msg"])
 
 tab1, tab2, tab3 = st.tabs([
-    "🏛️ 総合シグナル & 楽天証券 発注計算",
-    "🧪 ポートフォリオ バックテスト検証 & 統計指標", 
-    "📊 5大アセット テクニカル分析"
+    "🏛️ 現在シグナル & 楽天証券発注計算",
+    "🧪 統合パフォーマンス検証 & 統計指標",
+    "🔬 銘柄別パラメータ & 個別分析"
 ])
 
 # =============================================================
-# TAB 1: 総合シグナル & 発注計算
+# TAB 1: 現在シグナル & 発注計算
 # =============================================================
 with tab1:
     st.subheader("現在の各アセット市場レジーム判定")
     
-    # 5銘柄のシグナルカード
     cols = st.columns(5)
-    total_effective_exposure = 0.0
-    for idx_c, (sym, sig) in enumerate(asset_signals.items()):
-        w = weights[sym]
-        effective_alloc = w * sig["pos"]
-        total_effective_exposure += effective_alloc
+    tot_effective = 0.0
+    for idx_c, sym in enumerate(ASSETS.keys()):
+        sig = signals_now[sym]
+        w = user_weights[sym]
+        tot_effective += w * sig["pos"]
         
         with cols[idx_c]:
-            st.markdown(f"#### {sig['reg_icon']} {sym}")
-            st.caption(f"{PORTFOLIO_CONFIG[sym]['type']} (基本枠: {int(w*100)}%)")
-            st.metric(f"{sig['underlying']} 終値", f"${sig['u_close']:.2f}", f"{(sig['u_close']-sig['u_prev']):+.2f}")
-            st.write(f"判定: **{sig['reg_name']}**")
-            st.write(f"推奨投資枠: **{int(sig['pos']*100)}%**")
+            icon = "🟢" if sig["pos"] == 1.0 else ("🟡" if sig["pos"] > 0 else "🔴")
+            st.markdown(f"#### {icon} {sym}")
+            st.caption(f"{sig['type']} (配分: {int(w*100)}%)")
+            st.metric(f"{sig['underlying']} 終値", f"${sig['u_close']:.2f}")
+            st.write(f"推奨投資比率: **{int(sig['pos']*100)}%**")
             st.progress(sig["pos"])
-            st.caption(f"EMA: ${sig['ema']:.2f} ｜ HV: {sig['hv']:.1f}%")
+            st.caption(f"EMA({sig['ema_param']}): ${sig['ema']:.2f}\nHV20: {sig['hv']:.1f}% (閾値:{sig['hv_param']}%)")
 
-    # 全体配分サマリー & ドーナツチャート
-    cash_ratio = 1.0 - total_effective_exposure
+    cash_ratio = 1.0 - tot_effective
     st.markdown("---")
     
-    c_sum1, c_sum2 = st.columns([1.5, 1])
-    with c_sum1:
-        st.markdown("### 💼 ポートフォリオ総合エクスポージャー")
-        m_col1, m_col2 = st.columns(2)
-        m_col1.metric("総株式・ゴールド投資比率", f"{total_effective_exposure*100:.1f} %")
-        m_col2.metric("安全待機キャッシュ比率 (MMF等)", f"{cash_ratio*100:.1f} %")
-        st.info(f"💡 現在は全5資産のうち、市場環境が良いアセットだけを合計 **{total_effective_exposure*100:.1f}%** 保有し、残りの **{cash_ratio*100:.1f}%** は米ドルMMF（年利約4〜5%）で安全待機する指示となっています。")
-        
-    with c_sum2:
-        pie_labels = [PORTFOLIO_CONFIG[s]["name"] for s in PORTFOLIO_CONFIG.keys()] + ["米ドル現金 / MMF"]
-        pie_values = [weights[s] * asset_signals[s]["pos"] * 100 for s in PORTFOLIO_CONFIG.keys()] + [cash_ratio * 100]
+    c_s1, c_s2 = st.columns([1.5, 1])
+    with c_s1:
+        st.markdown("### 💼 ポートフォリオ総合配分")
+        m_c1, m_c2 = st.columns(2)
+        m_c1.metric("総株式・ゴールド投資比率", f"{tot_effective*100:.1f} %")
+        m_c2.metric("安全待機キャッシュ比率 (MMF等)", f"{cash_ratio*100:.1f} %")
+        st.info(f"💡 現在のシグナルに基づき、資産の **{tot_effective*100:.1f}%** を市場に配分し、残りの **{cash_ratio*100:.1f}%** を米ドルMMF（年利約4〜5%）に待機させます。")
+    with c_s2:
+        pie_labels = [s for s in ASSETS.keys()] + ["米ドルMMF / キャッシュ"]
+        pie_vals = [user_weights[s] * signals_now[s]["pos"] * 100 for s in ASSETS.keys()] + [cash_ratio * 100]
         fig_pie = go.Figure(data=[go.Pie(
-            labels=pie_labels,
-            values=pie_values,
-            hole=.45,
+            labels=pie_labels, values=pie_vals, hole=.45,
             marker_colors=['#00ba38', '#619cff', '#f5b041', '#9b59b6', '#f1c40f', '#b0b0b0']
         )])
         fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 楽天証券 発注シミュレーター
+    # 楽天証券 寄り付き発注シミュレーター
     st.markdown("---")
     st.subheader("💡 楽天証券 寄り付き発注シミュレーター（日本円・米ドル両対応）")
     
-    curr_col1, curr_col2, curr_col3 = st.columns([1.2, 1.5, 1.3])
-    with curr_col1:
-        input_currency = st.radio("入力通貨単位", ["日本円 (万円)", "米ドル (USD)"], horizontal=True)
-    with curr_col2:
-        if input_currency == "日本円 (万円)":
-            funds_jpy_man = st.number_input("運用総資金額（万円）", min_value=10, value=500, step=10)
+    curr_c1, curr_c2, curr_c3 = st.columns([1.2, 1.5, 1.3])
+    with curr_c1:
+        in_curr = st.radio("入力通貨単位", ["日本円 (万円)", "米ドル (USD)"], horizontal=True)
+    with curr_c2:
+        if in_curr == "日本円 (万円)":
+            f_jpy_man = st.number_input("運用総資金額（万円）", min_value=10, value=500, step=10)
         else:
-            funds_usd_in = st.number_input("運用総資金額（米ドル：USD）", min_value=1000, value=30000, step=1000)
-    with curr_col3:
-        fx_rate = st.number_input("適用為替レート (USD/JPY)", value=latest_fx_rate, step=0.5, format="%.2f")
+            f_usd_in = st.number_input("運用総資金額（米ドル：USD）", min_value=1000, value=30000, step=1000)
+    with curr_c3:
+        fx_val = st.number_input("適用為替レート (USD/JPY)", value=latest_fx_rate, step=0.5, format="%.2f")
 
-    if input_currency == "日本円 (万円)":
-        funds_total_jpy = funds_jpy_man * 10000.0
-        funds_total_usd = funds_total_jpy / fx_rate
+    if in_curr == "日本円 (万円)":
+        total_jpy = f_jpy_man * 10000.0
+        total_usd = total_jpy / fx_val
     else:
-        funds_total_usd = float(funds_usd_in)
-        funds_total_jpy = funds_total_usd * fx_rate
+        total_usd = float(f_usd_in)
+        total_jpy = total_usd * fx_val
 
-    st.success(f"💰 **運用総資産**: **${funds_total_usd:,.2f}** ＝ **約 {funds_total_jpy:,.0f} 円** （{funds_total_jpy/10000:,.1f} 万円）")
+    st.success(f"💰 **運用総資産**: **${total_usd:,.2f}** ＝ **約 {total_jpy:,.0f} 円** （{total_jpy/10000:,.1f} 万円）")
 
     sim_rows = []
-    for sym in PORTFOLIO_CONFIG.keys():
-        sig = asset_signals[sym]
-        w = weights[sym]
-        target_val_usd = funds_total_usd * w * sig["pos"]
-        target_val_jpy = target_val_usd * fx_rate
+    for sym in ASSETS.keys():
+        sig = signals_now[sym]
+        w = user_weights[sym]
+        t_usd = total_usd * w * sig["pos"]
+        t_jpy = t_usd * fx_val
         p = sig["etf_price"]
-        shares = int(target_val_usd // p)
-        
+        sh = int(t_usd // p)
         sim_rows.append({
             "銘柄": sig["name"],
-            "資産クラス": PORTFOLIO_CONFIG[sym]["type"],
-            "目標金額 (USD)": f"${target_val_usd:,.2f}",
-            "目標金額 (日本円)": f"約 {target_val_jpy:,.0f} 円 ({target_val_jpy/10000:,.1f}万)",
-            "参考現在価格": f"${p:.2f}",
-            "目標保有株数": f"{shares} 株",
-            "今夜のアクション": f"{shares} 株に調整" if target_val_usd > 0 else "全売却 (0株)"
+            "資産タイプ": sig["type"],
+            "目標金額 (USD)": f"${t_usd:,.2f}",
+            "目標金額 (日本円)": f"約 {t_jpy:,.0f} 円 ({t_jpy/10000:,.1f}万)",
+            "参考株価": f"${p:.2f}",
+            "目標保有株数": f"{sh} 株",
+            "今夜のアクション": f"{sh} 株に調整" if t_usd > 0 else "全売却 (0株)"
         })
-        
-    cash_val_usd = funds_total_usd * cash_ratio
-    cash_val_jpy = cash_val_usd * fx_rate
+    c_usd = total_usd * cash_ratio
+    c_jpy = c_usd * fx_val
     sim_rows.append({
         "銘柄": "米ドル現金 / MMF",
-        "資産クラス": "安全待機キャッシュ",
-        "目標金額 (USD)": f"${cash_val_usd:,.2f}",
-        "目標金額 (日本円)": f"約 {cash_val_jpy:,.0f} 円 ({cash_val_jpy/10000:,.1f}万)",
-        "参考現在価格": "-",
+        "資産タイプ": "安全待機資金",
+        "目標金額 (USD)": f"${c_usd:,.2f}",
+        "目標金額 (日本円)": f"約 {c_jpy:,.0f} 円 ({c_jpy/10000:,.1f}万)",
+        "参考株価": "-",
         "目標保有株数": "-",
         "今夜のアクション": "米ドルMMF等で安全待機 (利息年4〜5%)"
     })
     st.table(pd.DataFrame(sim_rows))
 
 # =============================================================
-# TAB 2: バックテスト検証 & 統計指標
+# TAB 2: パフォーマンス検証 & 統計指標
 # =============================================================
 with tab2:
-    st.subheader("🧪 5大アセット 全天候型ポートフォリオ 統計パフォーマンス")
-    st.caption("5つの資産クラスを分散し、レジーム判定により下落相場を回避した場合の過去5年間バックテスト結果です。")
+    st.subheader(f"🧪 全天候型ポートフォリオ 統計パフォーマンス検証 （{selected_period}）")
     
+    # 統計指標カード
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("期待年利 (CAGR)", f"{cagr_strat*100:.1f} %", f"バイ＆ホールド: {cagr_bm*100:.1f}%")
+    m1.metric("期待年利 (CAGR)", f"{cagr_strat*100:.1f} %", f"単主持: {cagr_bm*100:.1f}%")
     m2.metric("年率リスク (Vol)", f"{vol_strat*100:.1f} %", f"単主持: {vol_bm*100:.1f}%")
     m3.metric("最大下落率 (MDD)", f"{mdd_strat*100:.1f} %", f"単主持: {mdd_bm*100:.1f}%")
     m4.metric("プロフィットファクター (PF)", f"{pf_strat:.2f}")
@@ -310,29 +442,40 @@ with tab2:
     
     # 資産推移 & ドローダウン
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=common_idx, y=equity_strat, name="全天候型レジーム運用", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
-    fig_bt.add_trace(go.Scatter(x=common_idx, y=equity_bm, name="5銘柄バイ＆ホールド (放置)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
-    fig_bt.add_trace(go.Scatter(x=common_idx, y=dd_strat * 100, name="ドローダウン (%)", fill="tozeroy", line=dict(color="#d62728", width=1)), row=2, col=1)
-    fig_bt.update_layout(height=500, margin=dict(t=20, b=20, l=10, r=10), hovermode="x unified")
+    fig_bt.add_trace(go.Scatter(x=common_idx, y=cum_strat, name="全天候型レジーム運用", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=common_idx, y=cum_bm, name="5銘柄バイ＆ホールド (放置)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=common_idx, y=dd_s * 100, name="ドローダウン (%)", fill="tozeroy", line=dict(color="#d62728", width=1)), row=2, col=1)
+    fig_bt.update_layout(height=480, margin=dict(t=20, b=20, l=10, r=10), hovermode="x unified")
     fig_bt.update_yaxes(title_text="資産倍率", row=1, col=1)
     fig_bt.update_yaxes(title_text="下落率 (%)", row=2, col=1)
     st.plotly_chart(fig_bt, use_container_width=True)
 
 # =============================================================
-# TAB 3: テクニカルチャート
+# TAB 3: 銘柄別パラメータ & 個別分析
 # =============================================================
 with tab3:
-    st.subheader("📈 5大母体指数のテクニカル動向 (200日EMA比較)")
-    chart_cols = st.columns(2)
+    st.subheader("🔬 銘柄別 適用パラメータ & 単体パフォーマンス一覧")
     
-    underlying_list = [("QQQ", "#1f77b4"), ("SPY", "#2ca02c"), ("SOXX", "#9467bd"), ("XLF", "#d62728"), ("GLD", "#bcbd22")]
-    for i, (u_sym, color) in enumerate(underlying_list):
-        col_target = chart_cols[i % 2]
-        with col_target:
-            st.markdown(f"**{u_sym} ＆ {ema_span}日EMA**")
-            df_plot = market_data[u_sym].loc[common_idx]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=common_idx, y=df_plot["Close"], name=f"{u_sym} 終値", line=dict(color=color)))
-            fig.add_trace(go.Scatter(x=common_idx, y=df_plot["Close"].ewm(span=ema_span, adjust=False).mean(), name=f"{ema_span}日EMA", line=dict(color="#ff7f0e", width=1.5)))
-            fig.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
-            st.plotly_chart(fig, use_container_width=True)
+    asset_perf_table = []
+    for sym in ASSETS.keys():
+        s_ret, _, _, _, _, _ = eval_single_asset(sym, st.session_state[f"ema_{sym}"], st.session_state[f"hv_{sym}"], r2_input)
+        cum_single = np.cumprod(1.0 + s_ret)
+        cagr_s = cum_single[-1] ** (1.0 / yrs) - 1.0
+        mdd_s = np.min((cum_single - np.maximum.accumulate(cum_single)) / np.maximum.accumulate(cum_single))
+        calm_s = cagr_s / abs(mdd_s) if mdd_s != 0 else 0
+        g = np.sum(s_ret[s_ret > 0])
+        l = np.abs(np.sum(s_ret[s_ret < 0]))
+        pf_s = g / l if l != 0 else 0
+        
+        asset_perf_table.append({
+            "銘柄": sym,
+            "母体指数": ASSETS[sym]["underlying"],
+            "設定EMA日数": f"{st.session_state[f'ema_{sym}']} 日",
+            "設定HV閾値": f"{st.session_state[f'hv_{sym}']:.1f} %",
+            "ポートフォリオ配分": f"{int(user_weights[sym]*100)} %",
+            "単体CAGR": f"{cagr_s*100:.1f} %",
+            "単体MDD": f"{mdd_s*100:.1f} %",
+            "単体PF": f"{pf_s:.2f}",
+            "単体カルマー": f"{calm_s:.2f}"
+        })
+    st.table(pd.DataFrame(asset_perf_table))
