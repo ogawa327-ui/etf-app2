@@ -153,7 +153,7 @@ with st.spinner(f"市場データ（{selected_period_label}）を取得・解析
 latest_date_str = common_idx[-1].strftime('%Y年%m月%d日')
 
 # -------------------------------------------------------------
-# 5. SDE-Engine Pro 個別シグナル判定（9日RSI＆過熱抑制）
+# 5. SDE-Engine Pro 個別シグナル判定（是正改修版）
 # -------------------------------------------------------------
 def calc_parkinson_vol(df, window=10):
     high = df["High"].values
@@ -195,7 +195,7 @@ def run_asset_signals(sym):
     vol_score = -(vol_20 - cfg["u_vol_norm"]) / cfg["u_vol_norm"]
     adjusted_vol_score = np.where(combined_trend < 0, np.minimum(vol_score, 0.0), vol_score)
     
-    # 9日RSIによる短期過熱度測定
+    # 9日RSI
     rsi9 = calc_rsi(pd.Series(c_u), period=9)
     penalty_rsi = np.where(rsi9 > 70.0, (rsi9 - 70.0) / 20.0, 0.0)
     penalty_ema = np.where(diff_50 > 0.08, (diff_50 - 0.08) / 0.10, 0.0)
@@ -204,14 +204,20 @@ def run_asset_signals(sym):
     logit = 6.0 * combined_trend + 1.5 * adjusted_vol_score - 3.5 * overheat_penalty
     p_bull = 1.0 / (1.0 + np.exp(-logit))
     
-    bear_hard_cut = (c_u < ema200) | (diff_50 < -0.01)
-    p_bull = np.where(bear_hard_cut, np.minimum(p_bull, 0.25), p_bull)
+    # ★ハードキルの適正化
+    # 50日線割れ（diff_50 < -0.01）は完全防衛
+    # 200日線割れでも50日線より+3%以上反発していれば探査玉を許可
+    below_50 = diff_50 < -0.01
+    below_200_only = (c_u < ema200) & (diff_50 >= -0.01)
+    
+    p_bull = np.where(below_50, np.minimum(p_bull, 0.20), p_bull)
+    p_bull = np.where(below_200_only & (diff_50 < 0.03), np.minimum(p_bull, 0.30), p_bull)
     
     sigma_tgt = cfg["sigma_target"]
     vol_adj = np.clip(sigma_tgt / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
     w_star = np.clip(p_bull * vol_adj, 0.0, 1.0)
     w_star = w_star * (1.0 - overheat_penalty)
-    w_star = np.where(bear_hard_cut, 0.0, w_star)
+    w_star = np.where(below_50, 0.0, w_star)
     
     factor = np.where(
         (p_bull < 0.35) | (w_star < 0.10),
@@ -229,10 +235,21 @@ def run_asset_signals(sym):
     latest_diff200 = diff_200[-1]
     latest_rsi = rsi9[-1]
     latest_penalty = overheat_penalty[-1]
+    latest_below50 = below_50[-1]
+    latest_below200 = (c_u[-1] < ema200[-1])
     
-    if latest_p < 0.35 or latest_w < 0.10:
+    # ★表示メッセージの正確な分岐判定
+    if latest_below50:
         badge = "🔴 弱気防衛 (待機)"
-        desc = "移動平均線割れ / キャッシュ退避"
+        desc = "50日移動平均線割れ / キャッシュ退避"
+        phase_type = "None"
+    elif latest_below200 and latest_p < 0.35:
+        badge = "🔴 長期弱気 (待機)"
+        desc = "200日線下での調整局面 / キャッシュ退避"
+        phase_type = "None"
+    elif latest_p < 0.35:
+        badge = "🔴 弱気警戒 (待機)"
+        desc = "ボラティリティ過大・下落リスク / 待機"
         phase_type = "None"
     elif latest_penalty > 0.15:
         badge = "⚠️ 短期過熱警戒 (利確・抑制)"
@@ -328,21 +345,17 @@ tot_latest_cash = max(0.0, 1.0 - tot_latest_invested)
 st.title("⚡ SDE-Engine Pro 動的資金配分ダッシュボード")
 st.caption(f"検証範囲: **{selected_period_label}** （計 {n_days} 営業日）")
 
-# 初心者向け用語・指標ガイド
-with st.expander("📖 【用語・指標ガイド】RSI・50日EMA比・過熱抑制の仕組み", expanded=False):
+with st.expander("📖 【用語・指標ガイド】RSI・50日/200日EMA比・過熱抑制の仕組み", expanded=False):
     st.markdown("""
+    * **50日EMA比 ＆ 200日EMA比**  
+      現在の株価が中期線（50日線）および長期線（200日線）から何%離れているかを示します。
+      * **50日EMA比 > 0% かつ 200日EMA比 > 0%**: 完全な強気上昇トレンド（巡航）。
+      * **50日EMA比 > +8%**: 短期的な上方過剰乖離（過熱警戒・比率抑制）。
+      * **50日EMA比 < 0%**: 短期トレンド崩壊（完全キャッシュ退避）。
     * **9日RSI（相対力指数）**  
-      直近9営業日の値動きから、短期的な**「買われすぎ・売られすぎ」**を0〜100%で測定します。
-      * **70% 超**: 短期過熱水準（急騰による高値掴みを防ぐため、比率を自動抑制・利確）。
-      * **50% 前後**: 中立水準。
-      * **30% 未満**: 売られすぎ水準（底打ち反発候補）。
-    * **50日EMA比（短期移動平均乖離率）**  
-      現在の株価が中期トレンドライン（50日EMA）から何%離れているかを示します。
-      * **+8% 超**: トレンドから大きく上方乖離した過熱水準（急落・調整リスクに備えて比率抑制）。
-      * **0% 〜 +8%**: 健全で強い上昇トレンド。
-      * **0% 未満（マイナス）**: 移動平均線割れ（下落相場入りとみなし、即座に全額キャッシュ待機）。
+      直近9日間の買われすぎ・売られすぎを測定。**70%超**で高値掴み防止・部分利確ペナルティが作動します。
     * **動的資金配分（案A: 上限50%）**  
-      固定の配分枠を設けず、強気シグナルが出た銘柄だけに資金を集中。1銘柄への上限は50%とし、安全を確保しながら高収益を狙います。
+      固定枠を全廃し、強気シグナルが出た銘柄だけに資金を集中。1銘柄への上限は50%とし、安全を確保します。
     """)
 
 with st.container():
@@ -363,9 +376,9 @@ tab1, tab2, tab3 = st.tabs([
 # TAB 1: 今夜の最適配分 ＆ 執行シミュレーター
 # =============================================================
 with tab1:
-    st.info(f"📌 **直近データ確定日: {latest_date_str}（米国市場直近終値に基づく判定）**\n\n※このタブは今夜の発注株数を判定します。長期バックテストは「Tab 2」をご覧ください。")
+    st.info(f"📌 **直近データ確定日: {latest_date_str}（直近終値に基づく判定）**\n\n※このタブは今夜の発注株数を判定します。長期バックテストは「Tab 2」をご覧ください。")
     
-    st.subheader("📊 5銘柄の動的配分シグナル（過熱抑制 ＆ 移動平均線ハードキル）")
+    st.subheader("📊 5銘柄の動的配分シグナル（過熱抑制 ＆ トレンド透明化版）")
     cols = st.columns(5)
     
     for idx_c, sym in enumerate(keys):
@@ -381,7 +394,8 @@ with tab1:
             st.progress(float(sig["latest_p"]))
             
             st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (過熱目安: >70)")
-            st.caption(f"**50日EMA比:** {sig['latest_diff50']*100:+.1f}% (過熱目安: >+8%)")
+            # 50日EMA比と200日EMA比の両方を明示
+            st.caption(f"**50日比:** {sig['latest_diff50']*100:+.1f}% ｜ **200日比:** {sig['latest_diff200']*100:+.1f}%")
             st.caption(f"Parkinson Vol: {sig['latest_sigma']:.1f}%")
             
             st.info(f"**{sig['badge']}**\n\n*{sig['desc']}*")
@@ -410,7 +424,7 @@ with tab1:
         fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 楽天証券 執行シミュレーター（初期値 300万円）
+    # 楽天証券 執行シミュレーター
     st.markdown("---")
     st.subheader("💡 楽天証券 寄り付き発注シミュレーター（初期値 300万円）")
     
