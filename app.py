@@ -72,13 +72,13 @@ MAX_CAP = max_cap_pct / 100.0
 st.sidebar.info(f"""
 **【動的資金配分＆過熱抑制の仕様】**
 * 固定枠は完全撤廃。投資適格銘柄だけに資金集中。
-* 1銘柄への上限は **{max_cap_pct}%** に制限（案A）。
+* 1銘柄への上限は **{max_cap_pct}%** に自動制限。
 * 移動平均線割れは自動で **0% (待機)**。
-* **短期急騰・過熱時（RSI高騰／過剰上方乖離）は自動で比率を圧縮（高値掴み防止・利確）**。
+* 短期急騰・過熱時（9日RSI > 70 / 50日EMA比 > +8%）は自動で比率を圧縮（高値掴み防止・利確）。
 """)
 
 # -------------------------------------------------------------
-# 4. データ取得 & 未上場期間の科学的合成（バックフィル）
+# 4. データ取得 & 未上場期間の科学的合成
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_and_sync_market_data(period_str: str):
@@ -153,7 +153,7 @@ with st.spinner(f"市場データ（{selected_period_label}）を取得・解析
 latest_date_str = common_idx[-1].strftime('%Y年%m月%d日')
 
 # -------------------------------------------------------------
-# 5. SDE-Engine Pro 個別シグナル判定（過熱抑制機能付き）
+# 5. SDE-Engine Pro 個別シグナル判定（9日RSI＆過熱抑制）
 # -------------------------------------------------------------
 def calc_parkinson_vol(df, window=10):
     high = df["High"].values
@@ -166,7 +166,7 @@ def calc_parkinson_vol(df, window=10):
     pv[:window] = pv[window] if len(df) > window else 20.0
     return pv
 
-def calc_rsi(series, period=14):
+def calc_rsi(series, period=9):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -183,44 +183,36 @@ def run_asset_signals(sym):
     c_u = df_u["Close"].values
     c_etf = df_etf["Close"].values
     
-    # 1. 局所ボラティリティ
     sigma_local = calc_parkinson_vol(df_etf, window=10)
     
-    # 2. 移動平均 & トレンド乖離
     ema50 = pd.Series(c_u).ewm(span=50, adjust=False).mean().values
     ema200 = pd.Series(c_u).ewm(span=200, adjust=False).mean().values
     diff_50 = (c_u - ema50) / ema50
     diff_200 = (c_u - ema200) / ema200
     combined_trend = 0.60 * diff_50 + 0.40 * diff_200
     
-    # 3. ボラティリティ過熱度
     vol_20 = (pd.Series(c_u).pct_change().rolling(20).std() * np.sqrt(252) * 100).fillna(cfg["u_vol_norm"]).values
     vol_score = -(vol_20 - cfg["u_vol_norm"]) / cfg["u_vol_norm"]
     adjusted_vol_score = np.where(combined_trend < 0, np.minimum(vol_score, 0.0), vol_score)
     
-    # 4. ★新機能：短期急騰・過熱抑制エンジン（Overheat Penalty）
-    rsi14 = calc_rsi(pd.Series(c_u), period=14)
-    # RSI > 70 または 50日EMAからの上方乖離が +8% を超えた場合にペナルティ算出
-    penalty_rsi = np.where(rsi14 > 70.0, (rsi14 - 70.0) / 20.0, 0.0)
+    # 9日RSIによる短期過熱度測定
+    rsi9 = calc_rsi(pd.Series(c_u), period=9)
+    penalty_rsi = np.where(rsi9 > 70.0, (rsi9 - 70.0) / 20.0, 0.0)
     penalty_ema = np.where(diff_50 > 0.08, (diff_50 - 0.08) / 0.10, 0.0)
-    overheat_penalty = np.clip(penalty_rsi + penalty_ema, 0.0, 0.60)  # 最大60%抑制
+    overheat_penalty = np.clip(penalty_rsi + penalty_ema, 0.0, 0.60)
     
-    # 5. 強気確率 P(Bull) 算出（過熱時は確率の高騰を抑える）
     logit = 6.0 * combined_trend + 1.5 * adjusted_vol_score - 3.5 * overheat_penalty
     p_bull = 1.0 / (1.0 + np.exp(-logit))
     
-    # 移動平均線割れに対するハード・キル
     bear_hard_cut = (c_u < ema200) | (diff_50 < -0.01)
     p_bull = np.where(bear_hard_cut, np.minimum(p_bull, 0.25), p_bull)
     
-    # 6. 最適目標比率 W*（過熱時は直接比率を削って部分利確）
     sigma_tgt = cfg["sigma_target"]
     vol_adj = np.clip(sigma_tgt / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
     w_star = np.clip(p_bull * vol_adj, 0.0, 1.0)
-    w_star = w_star * (1.0 - overheat_penalty)  # 過熱時に比率引き下げ
+    w_star = w_star * (1.0 - overheat_penalty)
     w_star = np.where(bear_hard_cut, 0.0, w_star)
     
-    # 7. 執行フェーズ
     factor = np.where(
         (p_bull < 0.35) | (w_star < 0.10),
         0.0,
@@ -235,10 +227,9 @@ def run_asset_signals(sym):
     latest_w = w_star[-1]
     latest_diff50 = diff_50[-1]
     latest_diff200 = diff_200[-1]
-    latest_rsi = rsi14[-1]
+    latest_rsi = rsi9[-1]
     latest_penalty = overheat_penalty[-1]
     
-    # ステータスバッジ
     if latest_p < 0.35 or latest_w < 0.10:
         badge = "🔴 弱気防衛 (待機)"
         desc = "移動平均線割れ / キャッシュ退避"
@@ -258,7 +249,7 @@ def run_asset_signals(sym):
 
     return {
         "p_bull": p_bull, "w_star": w_star, "raw_w": raw_desired_w,
-        "sigma_local": sigma_local, "ema50": ema50, "ema200": ema200, "rsi14": rsi14,
+        "sigma_local": sigma_local, "ema50": ema50, "ema200": ema200, "rsi9": rsi9,
         "c_u": c_u, "c_etf": c_etf, "etf_ret": etf_ret,
         "latest_p": latest_p, "latest_w": latest_w, "latest_sigma": sigma_local[-1],
         "latest_diff50": latest_diff50, "latest_diff200": latest_diff200,
@@ -337,6 +328,23 @@ tot_latest_cash = max(0.0, 1.0 - tot_latest_invested)
 st.title("⚡ SDE-Engine Pro 動的資金配分ダッシュボード")
 st.caption(f"検証範囲: **{selected_period_label}** （計 {n_days} 営業日）")
 
+# 初心者向け用語・指標ガイド
+with st.expander("📖 【用語・指標ガイド】RSI・50日EMA比・過熱抑制の仕組み", expanded=False):
+    st.markdown("""
+    * **9日RSI（相対力指数）**  
+      直近9営業日の値動きから、短期的な**「買われすぎ・売られすぎ」**を0〜100%で測定します。
+      * **70% 超**: 短期過熱水準（急騰による高値掴みを防ぐため、比率を自動抑制・利確）。
+      * **50% 前後**: 中立水準。
+      * **30% 未満**: 売られすぎ水準（底打ち反発候補）。
+    * **50日EMA比（短期移動平均乖離率）**  
+      現在の株価が中期トレンドライン（50日EMA）から何%離れているかを示します。
+      * **+8% 超**: トレンドから大きく上方乖離した過熱水準（急落・調整リスクに備えて比率抑制）。
+      * **0% 〜 +8%**: 健全で強い上昇トレンド。
+      * **0% 未満（マイナス）**: 移動平均線割れ（下落相場入りとみなし、即座に全額キャッシュ待機）。
+    * **動的資金配分（案A: 上限50%）**  
+      固定の配分枠を設けず、強気シグナルが出た銘柄だけに資金を集中。1銘柄への上限は50%とし、安全を確保しながら高収益を狙います。
+    """)
+
 with st.container():
     c_k1, c_k2, c_k3 = st.columns([1.5, 1, 1.2])
     c_k1.markdown("#### 🛡️ カタストロフィ・キルスイッチ状態")
@@ -355,7 +363,7 @@ tab1, tab2, tab3 = st.tabs([
 # TAB 1: 今夜の最適配分 ＆ 執行シミュレーター
 # =============================================================
 with tab1:
-    st.info(f"📌 **直近データ確定日: {latest_date_str}（直近終値に基づく判定）**\n\n※このタブは今夜の発注株数を判定します。長期シミュレーションは「Tab 2」をご覧ください。")
+    st.info(f"📌 **直近データ確定日: {latest_date_str}（米国市場直近終値に基づく判定）**\n\n※このタブは今夜の発注株数を判定します。長期バックテストは「Tab 2」をご覧ください。")
     
     st.subheader("📊 5銘柄の動的配分シグナル（過熱抑制 ＆ 移動平均線ハードキル）")
     cols = st.columns(5)
@@ -372,8 +380,9 @@ with tab1:
             st.write(f"強気確率 $P(\\text{{Bull}})$: **{sig['latest_p']*100:.1f}%**")
             st.progress(float(sig["latest_p"]))
             
-            st.caption(f"14日RSI: **{sig['latest_rsi']:.1f}** ｜ Vol: **{sig['latest_sigma']:.1f}%**")
-            st.caption(f"50日EMA比: **{sig['latest_diff50']*100:+.1f}%**")
+            st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (過熱目安: >70)")
+            st.caption(f"**50日EMA比:** {sig['latest_diff50']*100:+.1f}% (過熱目安: >+8%)")
+            st.caption(f"Parkinson Vol: {sig['latest_sigma']:.1f}%")
             
             st.info(f"**{sig['badge']}**\n\n*{sig['desc']}*")
             
@@ -497,7 +506,7 @@ with tab2:
 # TAB 3: 銘柄別詳細分析
 # =============================================================
 with tab3:
-    st.subheader("📊 各銘柄の個別トレンド ＆ 過熱度 (RSI) 分析チャート")
+    st.subheader("📊 各銘柄の個別トレンド ＆ 過熱度 (9日RSI) 分析チャート")
     selected_asset = st.radio(
         "分析対象銘柄を選択",
         keys,
@@ -516,7 +525,7 @@ with tab3:
         row_heights=[0.45, 0.30, 0.25],
         subplot_titles=(
             f"① 母体指数 {u_sym} 価格 ＆ 50日/200日EMA",
-            f"② 母体指数 14日RSI (過熱ライン: 70)",
+            f"② 母体指数 9日RSI (過熱ライン: 70)",
             f"③ 強気確率 P(Bull) ＆ 最適保有比率 W* 推移"
         )
     )
@@ -525,7 +534,7 @@ with tab3:
     fig_single.add_trace(go.Scatter(x=common_idx, y=sig["ema50"], name="50日 EMA (短期)", line=dict(color="#17becf", width=1.5)), row=1, col=1)
     fig_single.add_trace(go.Scatter(x=common_idx, y=sig["ema200"], name="200日 EMA (長期)", line=dict(color="#ff7f0e", width=2)), row=1, col=1)
     
-    fig_single.add_trace(go.Scatter(x=common_idx, y=sig["rsi14"], name="14日 RSI", line=dict(color="#9467bd", width=1.5)), row=2, col=1)
+    fig_single.add_trace(go.Scatter(x=common_idx, y=sig["rsi9"], name="9日 RSI", line=dict(color="#9467bd", width=1.5)), row=2, col=1)
     fig_single.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
     fig_single.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
     
