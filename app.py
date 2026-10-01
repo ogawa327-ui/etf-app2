@@ -77,7 +77,7 @@ base_weights = {
 }
 
 # -------------------------------------------------------------
-# 4. データ取得関数（為替 & 市場データ）
+# 4. データ取得関数
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_market_data(period_str: str):
@@ -112,7 +112,6 @@ for k in market_data.keys():
 # 5. SDE-Engine 計算コア（トレンド分析・ボラティリティ制御）
 # -------------------------------------------------------------
 def calc_parkinson_vol(df, window=10):
-    """高値・安値を考慮したParkinsonボラティリティ (年率%)"""
     high = df["High"].values
     low = df["Low"].values
     hl_ratio = np.log(np.maximum(high, 1e-6) / np.maximum(low, 1e-6))
@@ -132,10 +131,10 @@ def run_sde_engine(sym):
     c_u = df_u["Close"].values
     c_etf = df_etf["Close"].values
     
-    # 1. 局所ボラティリティ (レバレッジ銘柄自体のParkinson Volatility)
+    # 1. 局所ボラティリティ
     sigma_local = calc_parkinson_vol(df_etf, window=10)
     
-    # 2. トレンド分析（200日指数平滑移動平均 EMA200 乖離度）
+    # 2. トレンド分析（200日移動平均 EMA200 乖離度）
     ema200 = pd.Series(c_u).ewm(span=200, adjust=False).mean().values
     trend_score = (c_u - ema200) / ema200
     
@@ -143,11 +142,11 @@ def run_sde_engine(sym):
     vol_20 = (pd.Series(c_u).pct_change().rolling(20).std() * np.sqrt(252) * 100).fillna(20.0).values
     vol_score = -(vol_20 - cfg["sigma_target"]) / cfg["sigma_target"]
     
-    # 4. 強気確率 P(Bull) 算出（ロジスティック／シグモイド関数）
+    # 4. 強気確率 P(Bull) 算出
     logit = 4.0 * trend_score + 1.2 * vol_score
     p_bull = 1.0 / (1.0 + np.exp(-logit))
     
-    # 5. Merton型 最適目標保有比率 W* (減価相殺制御)
+    # 5. Merton型 最適目標比率 W*
     sigma_tgt = cfg["sigma_target"]
     vol_adj = np.clip(sigma_tgt / np.maximum(sigma_local, 1e-4), 0.1, 1.5)
     w_star = np.clip(p_bull * vol_adj, 0.0, 1.0)
@@ -160,7 +159,7 @@ def run_sde_engine(sym):
     )
     actual_pos_series = w_star * phase_factor
     
-    # バックテスト実行（前日のシグナルで翌日運用）
+    # バックテスト実行（前日シグナルで翌日運用）
     exec_pos = np.zeros_like(actual_pos_series)
     exec_pos[1:] = actual_pos_series[:-1]
     
@@ -192,24 +191,21 @@ def run_sde_engine(sym):
     vol = np.std(strat_ret) * np.sqrt(252)
     bm_vol = np.std(bm_ret) * np.sqrt(252)
     
-    # 直近ステータス
+    # 直近ステータス判定
     latest_p = p_bull[-1]
     latest_w = w_star[-1]
     
     if latest_p < 0.35 or latest_w < 0.05:
-        phase_name = "Phase 0: 完全防衛"
         phase_badge = "🔴 キャッシュ退避"
-        phase_desc = "W*の 0% 保有（全額キャッシュ）"
+        phase_desc = "保有 0% (全額キャッシュ)"
         buy_factor = 0.0
     elif latest_p < 0.65:
-        phase_name = "Phase 1: 探査玉投入"
         phase_badge = "🟡 探査玉 (Scout)"
-        phase_desc = f"W*の 25% のみ打診買い ({latest_w * 0.25 * 100:.1f}%)"
+        phase_desc = f"W*の 25% 打診買い ({latest_w * 0.25 * 100:.1f}%)"
         buy_factor = 0.25
     else:
-        phase_name = "Phase 2: 本玉巡航"
         phase_badge = "🟢 本玉巡航 (Core)"
-        phase_desc = f"W*を 100% 満額保有 ({latest_w * 100:.1f}%)"
+        phase_desc = f"W*を 100% 保有 ({latest_w * 100:.1f}%)"
         buy_factor = 1.0
 
     actual_single_alloc = latest_w * buy_factor
@@ -225,7 +221,7 @@ def run_sde_engine(sym):
         "u_close": c_u[-1], "etf_price": c_etf[-1], "ema_last": ema200[-1],
         "latest_p": latest_p, "latest_w": latest_w,
         "latest_sigma": sigma_local[-1],
-        "phase_name": phase_name, "phase_badge": phase_badge, "phase_desc": phase_desc,
+        "phase_badge": phase_badge, "phase_desc": phase_desc,
         "buy_factor": buy_factor, "actual_single_alloc": actual_single_alloc
     }
 
@@ -258,26 +254,25 @@ p_pf = np.sum(p_strat_ret[p_strat_ret > 0]) / abs(np.sum(p_strat_ret[p_strat_ret
 st.title("⚡ SDE-Engine 全天候型レバレッジポートフォリオ制御システム")
 st.caption("金融工学・確率的最適制御 (Stochastic Optimal Control) に基づく連続リスク制御エンジン")
 
-# 用語解説アコーディオン
+# 初心者向け用語ガイド
 with st.expander("📖 【用語ガイド】強気確率 P(Bull)・目標比率 W*・執行フェーズ・トレンド分析とは？", expanded=False):
     st.markdown("""
     * **強気確率 $P(\\text{Bull})$ とは？**  
-      母体指数（QQQ等）の**200日移動平均（トレンド分析）**と**ボラティリティ構造**を統計モデル（シグモイド関数）で統合した「安定上昇環境にある確率」です。
+      母体指数（QQQ等）の**200日移動平均（トレンド分析）**と**ボラティリティ構造**から算出した「上昇トレンド相場にある確率」です。
       * **65% 以上**: 強い上昇トレンド（本玉を投入できる環境）
       * **35% 〜 65%**: レンジ相場または底打ち反発初期（探査玉のみで様子見）
       * **35% 未満**: 下落相場・危険水域（完全撤退・キャッシュ化）
     * **目標比率 $W^*$ (Dynamic Exposure) とは？**  
-      レバレッジETF特有の「ボラティリティによる複利減価（目減り）」を相殺するために計算された**安全保有上限比率（0〜100%）**です。相場が荒れている時は自動的に引き下げられます。
+      レバレッジETF特有の「複利減価（下落耐性低下）」を防ぐため、ボラティリティの荒さに応じて計算された**安全保有上限比率（0〜100%）**です。
     * **執行フェーズ（二相型エントリー）とは？**  
-      「全額投資か完全撤退か」の極端な売買を排し、機会損失とリスクのバランスを取る仕組みです。
       * **Phase 2（本玉巡航）**: トレンド確立。目標比率 $W^*$ の **100%（満額）** を保有します。
-      * **Phase 1（探査玉投入）**: 底打ち初動。目標比率 $W^*$ の **25% だけを打診買い**し、急反発の機会損失を防ぎつつ再急落に備えます。
+      * **Phase 1（探査玉投入）**: 底打ち初動。目標比率 $W^*$ の **25% だけを打診買い**し、機会損失を防ぎつつ再急落に備えます。
       * **Phase 0（完全防衛）**: 相場崩壊。比率に関わらず **0%（全額キャッシュ退避）** とします。
     * **トレンド分析は組み込まれているか？**  
-      はい。各母体指数の**200日指数平滑移動平均（EMA200）からの乖離率**が、強気確率 $P(\\text{Bull})$ の最も中核的な判断要素として常時計算されています。
+      はい。各母体指数の**200日移動平均（EMA200）からの乖離率**が、強気確率 $P(\\text{Bull})$ の中核的判断要素として組み込まれています。
     """)
 
-# ハードウェア的キルスイッチ・ステータス
+# キルスイッチ表示
 with st.container():
     c_k1, c_k2, c_k3 = st.columns([1.5, 1, 1.2])
     c_k1.markdown("#### 🛡️ カタストロフィ・キルスイッチ状態")
@@ -303,7 +298,6 @@ with tab1:
     for idx_c, sym in enumerate(ASSETS.keys()):
         res = asset_results[sym]
         base_w = base_weights[sym]
-        # ポートフォリオ全体に対する実効買付比率
         effective_alloc = base_w * res["actual_single_alloc"]
         tot_effective += effective_alloc
         
@@ -313,23 +307,14 @@ with tab1:
             st.metric(f"{ASSETS[sym]['underlying']} 終値", f"${res['u_close']:.2f}")
             
             # 強気確率
-            st.write(
-                f"強気確率 $P(\\text{{Bull}})$: **{res['latest_p']*100:.1f}%**",
-                help="母体指数の200日EMAトレンド分析と市場ボラティリティから判定した上昇相場確率"
-            )
+            st.write(f"強気確率 $P(\\text{{Bull}})$: **{res['latest_p']*100:.1f}%**")
             st.progress(float(res["latest_p"]))
             
             # ボラティリティ状況
-            st.caption(
-                f"Parkinson Vol: **{res['latest_sigma']:.1f}%**\n(目標: {ASSETS[sym]['sigma_target']}%)",
-                help="銘柄固有の値動きの激しさ。目標値を超えて荒れている時は目標比率 W* を引き下げて減価を防ぎます"
-            )
+            st.caption(f"Parkinson Vol: **{res['latest_sigma']:.1f}%** (目標: {ASSETS[sym]['sigma_target']}%)")
             
             # 目標比率 W*
-            st.write(
-                f"目標比率 $W^*$: **{res['latest_w']*100:.1f}%**",
-                help="レバレッジ減価を相殺するための安全保有上限比率"
-            )
+            st.write(f"目標比率 $W^*$: **{res['latest_w']*100:.1f}%**")
             
             # フェーズ判定バッジ
             st.info(f"**{res['phase_badge']}**\n\n*{res['phase_desc']}*")
@@ -347,7 +332,7 @@ with tab1:
         m_c1, m_c2 = st.columns(2)
         m_c1.metric("総市場エクスポージャー (実効投資比率)", f"{tot_effective*100:.1f} %")
         m_c2.metric("安全待機キャッシュ比率 (米ドルMMF等)", f"{cash_ratio*100:.1f} %")
-        st.info(f"💡 市場のボラティリティ過熱・下落確率に応じてエクスポージャーを連続制御中。残りの **{cash_ratio*100:.1f}%** は米ドルMMF（年利約4〜5%）に待機させ、金利を受け取りながら暴落から資金を守ります。")
+        st.info(f"💡 市場のボラティリティ過熱・下落確率に応じて保有比率を制御中。残りの **{cash_ratio*100:.1f}%** は米ドルMMF（年利約4〜5%）に待機させ、金利を受け取りながら資産を守ります。")
     with c_s2:
         pie_labels = [s for s in ASSETS.keys() if base_weights[s] > 0] + ["米ドルMMF / キャッシュ"]
         pie_vals = [base_weights[s] * asset_results[s]["actual_single_alloc"] * 100 for s in ASSETS.keys() if base_weights[s] > 0] + [cash_ratio * 100]
@@ -358,9 +343,7 @@ with tab1:
         fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # ---------------------------------------------------------
-    # 楽天証券 執行シミュレーター（二相型 & ±10%リバランスバンド）
-    # ---------------------------------------------------------
+    # 楽天証券 執行シミュレーター
     st.markdown("---")
     st.subheader("💡 楽天証券 寄り付き発注シミュレーター（二相型発注 ＆ ±10%リバランスバンド判定）")
     
@@ -390,25 +373,19 @@ with tab1:
         base_w = base_weights[sym]
         p = res["etf_price"]
         
-        # 実効買付金額 (USD)
         target_usd = total_usd * base_w * res["actual_single_alloc"]
         target_jpy = target_usd * fx_val
         target_shares = int(target_usd // p) if p > 0 else 0
         
-        # 探査玉（25%）と本玉（残り）の株数内訳
         scout_part_usd = total_usd * base_w * (res["latest_w"] * 0.25)
         scout_shares = int(scout_part_usd // p) if p > 0 else 0
         core_shares = max(0, target_shares - scout_shares) if res["buy_factor"] == 1.0 else 0
         
-        # 発注アクションのテキスト
         if base_w == 0:
-            rebal_status = "⚪ 配分枠0%"
-            action = "買付不要 (対象外)"
+            action = "買付不要 (枠0%)"
         elif target_shares == 0:
-            rebal_status = "🔴 全売却・退避"
             action = "全ポジション売却してキャッシュ化 (0株)"
         else:
-            rebal_status = "✅ 許容バンド内"
             if res["buy_factor"] == 0.25:
                 action = f"探査玉（打診買い）として {target_shares} 株を発注"
             else:
