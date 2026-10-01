@@ -15,28 +15,28 @@ st.set_page_config(
 )
 
 # -------------------------------------------------------------
-# 2. アセット基本構成 & 銘柄パラメータ
+# 2. アセット構成 & アセット固有ボラティリティ基準
 # -------------------------------------------------------------
 ASSETS = {
     "TQQQ": {
         "name": "TQQQ (NASDAQ 3倍)", "underlying": "QQQ", "type": "ハイテク",
-        "leverage": 3.0, "sigma_target": 55.0, "color": "#00ba38"
+        "leverage": 3.0, "sigma_target": 55.0, "u_vol_norm": 20.0, "color": "#00ba38"
     },
     "SPXL": {
         "name": "SPXL (S&P500 3倍)", "underlying": "SPY", "type": "米国全体",
-        "leverage": 3.0, "sigma_target": 45.0, "color": "#619cff"
+        "leverage": 3.0, "sigma_target": 45.0, "u_vol_norm": 16.0, "color": "#619cff"
     },
     "SOXL": {
         "name": "SOXL (半導体 3倍)", "underlying": "SOXX", "type": "半導体",
-        "leverage": 3.0, "sigma_target": 65.0, "color": "#f5b041"
+        "leverage": 3.0, "sigma_target": 65.0, "u_vol_norm": 28.0, "color": "#f5b041"
     },
     "FAS":  {
         "name": "FAS (金融株 3倍)",   "underlying": "XLF", "type": "金融",
-        "leverage": 3.0, "sigma_target": 50.0, "color": "#9b59b6"
+        "leverage": 3.0, "sigma_target": 50.0, "u_vol_norm": 18.0, "color": "#9b59b6"
     },
     "UGL":  {
         "name": "UGL (ゴールド 2倍)",  "underlying": "GLD", "type": "ゴールド",
-        "leverage": 2.0, "sigma_target": 35.0, "color": "#f1c40f"
+        "leverage": 2.0, "sigma_target": 35.0, "u_vol_norm": 13.0, "color": "#f1c40f"
     },
 }
 
@@ -49,13 +49,13 @@ period_options = {
     "5y (直近5年間: 2021〜現在)": "5y",
     "10y (直近10年間: 2016〜現在)": "10y",
     "15y (直近15年間: 2011〜現在)": "15y",
-    "20y (直近20年間: 2006〜現在・リーマンショック含む)": "20y",
-    "25y (直近25年間: 2001〜現在・ITバブル崩壊含む)": "25y",
+    "20y (直近20年間: 2006〜現在・リーマン含む)": "20y",
+    "25y (直近25年間: 2001〜現在・ITバブル含む)": "25y",
     "30y (直近30年間: 1996〜現在)": "30y"
 }
 
 selected_period_label = st.sidebar.selectbox(
-    "📅 バックテスト期間の選択",
+    "📅 バックテスト検証期間の選択",
     list(period_options.keys()),
     index=1
 )
@@ -73,8 +73,8 @@ st.sidebar.info(f"""
 **【動的資金配分の仕様】**
 * 固定枠は完全撤廃されました。
 * 投資適格な銘柄だけに資金を集中投入します。
-* 1銘柄への過度な集中を防ぐため、1銘柄の上限は **{max_cap_pct}%** に自動制限されます（案A）。
-* 複数銘柄が強気になれば最大100%まで配分を拡大します。
+* 1銘柄への上限は **{max_cap_pct}%** に自動制限されます。
+* 移動平均線を割り込んだ銘柄は自動で **0% (完全退避)** となります。
 """)
 
 # -------------------------------------------------------------
@@ -90,7 +90,6 @@ def load_and_sync_market_data(period_str: str):
             df.columns = df.columns.get_level_values(0)
         raw_data[t] = df.dropna()
         
-    # 原資産の共通日付をベースに設定
     u_tickers = ["QQQ", "SPY", "SOXX", "XLF", "GLD"]
     base_idx = raw_data["SPY"].index
     for u in u_tickers:
@@ -101,45 +100,34 @@ def load_and_sync_market_data(period_str: str):
     for u in u_tickers:
         cleaned_data[u] = raw_data[u].loc[base_idx].copy()
 
-    # レバレッジETFが未上場の過去期間を原資産リターン×倍率で合成
     for sym, cfg in ASSETS.items():
         u_sym = cfg["underlying"]
         lev = cfg["leverage"]
         df_u = cleaned_data[u_sym]
         df_etf = raw_data[sym]
         
-        # 原資産の価格系列とリターン
         u_close = df_u["Close"]
         u_ret = u_close.pct_change().fillna(0)
+        syn_ret = u_ret * lev - (0.0095 / 252.0)  # 年率0.95%信託報酬控除
         
-        # 合成ETFの終値系列を作成
-        syn_ret = u_ret * lev - (0.0095 / 252.0)  # 年率0.95%の信託報酬を日次控除
-        
-        # ETFの実データが存在する日付
         real_idx = df_etf.index.intersection(base_idx)
         if len(real_idx) > 0:
             first_real_date = real_idx[0]
-            # 実データと合成データの接続
             real_close = df_etf.loc[real_idx, "Close"]
             first_price = real_close.iloc[0]
-            
-            # 実データより前の期間を逆算
             pre_idx = base_idx[base_idx < first_real_date]
             if len(pre_idx) > 0:
                 pre_ret = syn_ret.loc[pre_idx]
-                # 逆算累積
                 rev_cum = np.cumprod(1.0 + pre_ret.values[::-1])[::-1]
                 synth_pre_price = first_price / rev_cum
                 full_close = pd.concat([pd.Series(synth_pre_price, index=pre_idx), real_close])
             else:
                 full_close = real_close
         else:
-            # 実データが一切ない場合は全期間合成
             full_close = 100.0 * np.cumprod(1.0 + syn_ret)
             
         full_close = full_close.reindex(base_idx).ffill().bfill()
         
-        # 高値・安値の近似合成
         df_res = pd.DataFrame(index=base_idx)
         df_res["Close"] = full_close
         df_res["High"] = full_close * (1.0 + np.abs(syn_ret) * 0.6)
@@ -158,12 +146,14 @@ def get_usdjpy_rate():
     except:
         return 155.0
 
-with st.spinner(f"市場データ（{selected_period_label}）を取得・合成解析中..."):
+with st.spinner(f"市場データ（{selected_period_label}）を取得・解析中..."):
     market_data, common_idx = load_and_sync_market_data(period_code)
     latest_fx_rate = get_usdjpy_rate()
 
+latest_date_str = common_idx[-1].strftime('%Y年%m月%d日')
+
 # -------------------------------------------------------------
-# 5. SDE-Engine Pro 個別シグナル判定
+# 5. SDE-Engine Pro 個別シグナル判定（是正改修版）
 # -------------------------------------------------------------
 def calc_parkinson_vol(df, window=10):
     high = df["High"].values
@@ -185,27 +175,42 @@ def run_asset_signals(sym):
     c_u = df_u["Close"].values
     c_etf = df_etf["Close"].values
     
+    # 局所ボラティリティ
     sigma_local = calc_parkinson_vol(df_etf, window=10)
     
-    # マルチタイムフレーム・トレンド（50日EMA ＋ 200日EMA）
+    # マルチタイムフレーム移動平均
     ema50 = pd.Series(c_u).ewm(span=50, adjust=False).mean().values
     ema200 = pd.Series(c_u).ewm(span=200, adjust=False).mean().values
     
-    short_trend = (c_u - ema50) / ema50
-    long_trend = (ema50 - ema200) / ema200
-    combined_trend = 0.65 * short_trend + 0.35 * long_trend
+    # トレンド乖離率
+    diff_50 = (c_u - ema50) / ema50
+    diff_200 = (c_u - ema200) / ema200
     
-    vol_20 = (pd.Series(c_u).pct_change().rolling(20).std() * np.sqrt(252) * 100).fillna(20.0).values
-    vol_score = -(vol_20 - 30.0) / 30.0
+    # 厳格トレンドスコア: 株価がEMA50・EMA200両方を上回っているときのみ高加点
+    combined_trend = 0.60 * diff_50 + 0.40 * diff_200
     
-    logit = 6.0 * combined_trend + 1.5 * vol_score
+    # アセット別ボラティリティ過熱度
+    vol_20 = (pd.Series(c_u).pct_change().rolling(20).std() * np.sqrt(252) * 100).fillna(cfg["u_vol_norm"]).values
+    vol_score = -(vol_20 - cfg["u_vol_norm"]) / cfg["u_vol_norm"]
+    
+    # ★バグ修正ポイント: トレンドがマイナスの場合、ボラティリティ加点（下駄）を無効化
+    adjusted_vol_score = np.where(combined_trend < 0, np.minimum(vol_score, 0.0), vol_score)
+    
+    logit = 6.0 * combined_trend + 1.5 * adjusted_vol_score
     p_bull = 1.0 / (1.0 + np.exp(-logit))
     
+    # ★バグ修正ポイント: 移動平均線割れに対するハード・キル
+    # 株価が200日線を下回っている、または50日線を明確に下回っている場合は強制的に弱気判定
+    bear_hard_cut = (c_u < ema200) | (diff_50 < -0.01)
+    p_bull = np.where(bear_hard_cut, np.minimum(p_bull, 0.25), p_bull)
+    
+    # 最適目標比率 W*
     sigma_tgt = cfg["sigma_target"]
     vol_adj = np.clip(sigma_tgt / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
     w_star = np.clip(p_bull * vol_adj, 0.0, 1.0)
+    w_star = np.where(bear_hard_cut, 0.0, w_star)
     
-    # 投資適格係数（Phase 0: 0.0, Phase 1: 0.5, Phase 2: 1.0）
+    # 執行フェーズ
     factor = np.where(
         (p_bull < 0.35) | (w_star < 0.10),
         0.0,
@@ -218,9 +223,12 @@ def run_asset_signals(sym):
     
     latest_p = p_bull[-1]
     latest_w = w_star[-1]
+    latest_diff50 = diff_50[-1]
+    latest_diff200 = diff_200[-1]
+    
     if latest_p < 0.35 or latest_w < 0.10:
-        badge = "🔴 対象外 (待機)"
-        desc = "シグナル消滅・キャッシュ退避"
+        badge = "🔴 弱気防衛 (待機)"
+        desc = "移動平均線割れ / キャッシュ退避"
         phase_type = "None"
     elif latest_p < 0.55:
         badge = "🟡 探査玉投入"
@@ -236,14 +244,16 @@ def run_asset_signals(sym):
         "sigma_local": sigma_local, "ema50": ema50, "ema200": ema200,
         "c_u": c_u, "c_etf": c_etf, "etf_ret": etf_ret,
         "latest_p": latest_p, "latest_w": latest_w, "latest_sigma": sigma_local[-1],
+        "latest_diff50": latest_diff50, "latest_diff200": latest_diff200,
         "badge": badge, "desc": desc, "phase_type": phase_type,
-        "u_close": c_u[-1], "etf_price": c_etf[-1]
+        "u_close": c_u[-1], "etf_price": c_etf[-1],
+        "ema50_last": ema50[-1], "ema200_last": ema200[-1]
     }
 
 signals = {s: run_asset_signals(s) for s in ASSETS.keys()}
 
 # -------------------------------------------------------------
-# 6. 動的資金配分エンジン（日次最適化シミュレーション）
+# 6. 動的資金配分エンジン
 # -------------------------------------------------------------
 n_days = len(common_idx)
 keys = list(ASSETS.keys())
@@ -257,24 +267,19 @@ for t in range(n_days):
     if n_active == 0:
         continue
     elif n_active == 1:
-        # 1銘柄のみ適格の場合：上限MAX_CAP (50%) を上限に配分
         idx = np.where(active_mask)[0][0]
         daily_alloc_matrix[t, idx] = min(raw_weights[idx], MAX_CAP)
     else:
-        # 複数銘柄適格の場合：スコア比率で配分し、各銘柄MAX_CAPを適用
         tot_raw = np.sum(raw_weights[active_mask])
         cand_w = np.zeros(len(keys))
         for i in range(len(keys)):
             if active_mask[i]:
-                # 全体で100%を超えないように調整しつつ、各銘柄上限を適用
                 cand_w[i] = min((raw_weights[i] / tot_raw) if tot_raw > 1.0 else raw_weights[i], MAX_CAP)
         daily_alloc_matrix[t] = cand_w
 
-# バックテスト実行（前日ウェイトで翌日運用）
 exec_matrix = np.zeros_like(daily_alloc_matrix)
 exec_matrix[1:] = daily_alloc_matrix[:-1]
 
-# キャッシュ金利（米ドルMMF 日次利息 年利約3.5%）
 daily_cash_rate = (0.035 / 252.0)
 ret_matrix = np.column_stack([signals[k]["etf_ret"] for k in keys])
 
@@ -282,7 +287,6 @@ strat_daily_ret = np.sum(exec_matrix * ret_matrix, axis=1)
 cash_ratio_daily = 1.0 - np.sum(exec_matrix, axis=1)
 strat_daily_ret += cash_ratio_daily * daily_cash_rate
 
-# 5銘柄均等バイ＆ホールド比較ベンチマーク
 bm_daily_ret = np.mean(ret_matrix, axis=1)
 
 cum_strat = np.cumprod(1.0 + strat_daily_ret)
@@ -306,7 +310,6 @@ pos_ret = strat_daily_ret[strat_daily_ret > 0]
 neg_ret = strat_daily_ret[strat_daily_ret < 0]
 strat_pf = np.sum(pos_ret) / np.abs(np.sum(neg_ret)) if len(neg_ret) > 0 else 0
 
-# 直近（今夜）の動的配分結果
 latest_alloc = daily_alloc_matrix[-1]
 tot_latest_invested = np.sum(latest_alloc)
 tot_latest_cash = max(0.0, 1.0 - tot_latest_invested)
@@ -315,7 +318,7 @@ tot_latest_cash = max(0.0, 1.0 - tot_latest_invested)
 # 7. メイン画面ヘッダー
 # -------------------------------------------------------------
 st.title("⚡ SDE-Engine Pro 動的資金配分ダッシュボード")
-st.caption(f"検証期間: **{selected_period_label}** （{common_idx[0].strftime('%Y/%m/%d')} 〜 {common_idx[-1].strftime('%Y/%m/%d')} ｜ 計 {n_days} 営業日）")
+st.caption(f"バックテスト検証範囲: **{selected_period_label}** （計 {n_days} 営業日）")
 
 # カタストロフィ・キルスイッチ
 with st.container():
@@ -328,7 +331,7 @@ st.markdown("---")
 
 tab1, tab2, tab3 = st.tabs([
     "🏛️ 今夜の最適配分 ＆ 楽天証券 執行シミュレーター",
-    "🧪 超長期パフォーマンス検証（5年〜30年）",
+    "🧪 超長期バックテスト検証（5年〜30年）",
     "📊 銘柄別詳細分析（チャート・シグナル）"
 ])
 
@@ -336,7 +339,9 @@ tab1, tab2, tab3 = st.tabs([
 # TAB 1: 今夜の最適配分 ＆ 執行シミュレーター
 # =============================================================
 with tab1:
-    st.subheader("📊 5銘柄の動的配分シグナル（固定枠なし・適格銘柄へ自動集中）")
+    st.info(f"📌 **直近データ確定日: {latest_date_str}（米国市場直近終値に基づく判定）**\n\n※このタブは「今夜の発注判断」を行うため、直近最新日のデータを参照しています。過去の長期推移は「Tab 2」をご覧ください。")
+    
+    st.subheader("📊 5銘柄の動的配分シグナル（移動平均線割れハード・キル機能付き）")
     cols = st.columns(5)
     
     for idx_c, sym in enumerate(keys):
@@ -351,7 +356,10 @@ with tab1:
             st.write(f"強気確率 $P(\\text{{Bull}})$: **{sig['latest_p']*100:.1f}%**")
             st.progress(float(sig["latest_p"]))
             
+            # トレンド乖離状況
+            st.caption(f"50日EMA比: **{sig['latest_diff50']*100:+.1f}%** | 200日EMA比: **{sig['latest_diff200']*100:+.1f}%**")
             st.caption(f"Parkinson Vol: **{sig['latest_sigma']:.1f}%**")
+            
             st.info(f"**{sig['badge']}**\n\n*{sig['desc']}*")
             
             if alloc_ratio > 0:
@@ -367,7 +375,7 @@ with tab1:
         m_c1, m_c2 = st.columns(2)
         m_c1.metric("総株式・ゴールド投資比率", f"{tot_latest_invested*100:.1f} %")
         m_c2.metric("安全待機MMF比率 (待機資金)", f"{tot_latest_cash*100:.1f} %")
-        st.info(f"💡 強気シグナルが点灯した銘柄だけに資金を集中。1銘柄上限は **{max_cap_pct}%** に制限し、残りの **{tot_latest_cash*100:.1f}%** は米ドルMMF（年利約3.5〜4.5%）で安全待機します。")
+        st.info(f"💡 強気トレンドの適格銘柄だけに資金を集中。1銘柄上限は **{max_cap_pct}%** に制限され、移動平均線割れ等の非適格銘柄の資金は米ドルMMF（年利約3.5〜4.5%）で安全待機します。")
     with c_s2:
         pie_labels = [keys[i] for i in range(len(keys)) if latest_alloc[i] > 0] + ["米ドルMMF"]
         pie_vals = [latest_alloc[i] * 100 for i in range(len(keys)) if latest_alloc[i] > 0] + [tot_latest_cash * 100]
@@ -413,7 +421,7 @@ with tab1:
         target_shares = int(target_usd // p) if p > 0 else 0
         
         if alloc_ratio == 0:
-            action = "待機・買付なし (保有中の場合は全売却)"
+            action = "待機・買付なし (保有中の場合は全売却してMMFへ)"
         elif sig["phase_type"] == "Scout":
             action = f"🟡 探査玉として {target_shares} 株を買付 (初動打診)"
         else:
