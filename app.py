@@ -1,6 +1,6 @@
 """
 SDE-Engine Pro: 動的資金配分・クオンツポートフォリオ管理システム
-レバレッジETFのボラティリティコントロールおよび過熱抑制ロジックを統合した本番運用向け実装
+案A準拠: Wilder平滑RSI + 過熱早期検知閾値（RSI 66.0）適用版
 """
 
 from typing import Dict, Tuple, Any
@@ -18,6 +18,14 @@ EXPENSE_RATIO_ANNUAL = 0.0095      # レバレッジETF推定年間経費率
 CASH_YIELD_ANNUAL = 0.035          # 米ドルMMF年間想定利回り
 TRADING_DAYS_PER_YEAR = 252        # 年間営業日数
 EPSILON = 1e-9                     # ゼロ除算防止用微小量
+
+# 過熱抑制・シグナルパラメータ（案A適用）
+RSI_PERIOD = 9                     # RSI算出期間
+RSI_OVERHEAT_THRESHOLD = 66.0      # 早期過熱警戒RSI閾値（案A: 70.0から66.0へ引き締め）
+RSI_PENALTY_SCALE = 20.0           # RSIペナルティスケーリング幅
+EMA_DIVERGENCE_THRESHOLD = 0.08    # 50日EMA上方乖離過熱閾値 (+8%)
+EMA_PENALTY_SCALE = 0.10           # EMA乖離ペナルティスケーリング幅
+MAX_OVERHEAT_PENALTY = 0.60        # 最大過熱ペナルティ圧縮率 (60%)
 
 ASSETS: Dict[str, Dict[str, Any]] = {
     "TQQQ": {
@@ -78,22 +86,21 @@ max_cap_pct = st.sidebar.slider(
 max_cap = max_cap_pct / 100.0
 
 st.sidebar.info(f"""
-**【動的配分・リスク抑制仕様】**
+**【動的配分・過熱抑制仕様（案A適用）】**
 * 投資適格銘柄のみに動的集中（1銘柄上限 **{max_cap_pct}%**）。
 * 50日EMA割れ時は即座に **0% (待機)** に遮断。
-* 9日RSI > 70 または 50日EMA乖離 > +8% で過熱抑制（高値掴み防止・部分利確）。
+* 9日RSI > **{RSI_OVERHEAT_THRESHOLD:.0f}** または 50日EMA乖離 > +8% で過熱抑制（高値掴み防止・部分利確）。
 """)
 
 # =============================================================
 # 3. データ取得 & 幾何整合合成データ生成エンジン
 # =============================================================
 def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """MultiIndexの解除・タイムゾーン正規化・主要列の検証を行う"""
+    """MultiIndexの解除・タイムゾーン正規化・主要列の検証"""
     if df.empty:
         return df
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    # tz-aware / tz-naive の不整合を完全解消
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
     required_cols = ["Open", "High", "Low", "Close", "Volume"]
@@ -104,9 +111,7 @@ def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame], pd.DatetimeIndex]:
-    """
-    全銘柄の取得、共通インデックス整流、未上場期間のフォワード幾何スケーリング合成
-    """
+    """全銘柄の取得、共通インデックス整流、未上場期間のフォワード幾何スケーリング合成"""
     u_tickers = [cfg["underlying"] for cfg in ASSETS.values()]
     etf_tickers = list(ASSETS.keys())
     all_tickers = sorted(list(set(u_tickers + etf_tickers)))
@@ -124,7 +129,6 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
     if "SPY" not in raw_data or raw_data["SPY"].empty:
         raise RuntimeError("基準母体データ (SPY) の取得に失敗しました。時間をおいて再試行してください。")
 
-    # 全母体インデックスの交差を取得（基準期間の確定）
     base_idx = raw_data["SPY"].index
     for u in u_tickers:
         if u in raw_data and not raw_data[u].empty:
@@ -137,18 +141,15 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
     for u in u_tickers:
         cleaned_data[u] = raw_data[u].loc[base_idx].copy()
 
-    # レバレッジETFデータの構築（未上場期間の幾何スケーリング合成）
     for sym, cfg in ASSETS.items():
         u_sym = cfg["underlying"]
         lev = cfg["leverage"]
         df_u = cleaned_data[u_sym]
-        
-        # 母体の日次幾何リターンから信託報酬控除後のレバレッジリターンを算出
+
         u_ret = df_u["Close"].pct_change().fillna(0.0)
         daily_expense = EXPENSE_RATIO_ANNUAL / TRADING_DAYS_PER_YEAR
         syn_ret = (u_ret * lev) - daily_expense
 
-        # 累積成長ファクター
         cum_growth = (1.0 + syn_ret).cumprod()
 
         has_real_etf = (sym in raw_data) and (not raw_data[sym].empty)
@@ -161,12 +162,10 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
             growth_anchor = float(cum_growth.loc[first_real_date])
             scale = first_real_price / np.maximum(growth_anchor, EPSILON)
 
-            # 未上場期間の合成価格を実データ起点に整合
             synth_close = cum_growth * scale
             full_close = synth_close.copy()
             full_close.loc[real_idx] = df_real["Close"]
 
-            # High / Low の統合：実上場期間は本物の市場価格、未上場期間は母体のボラティリティ比率から近似
             full_high = pd.Series(index=base_idx, dtype=float)
             full_low = pd.Series(index=base_idx, dtype=float)
             full_high.loc[real_idx] = df_real["High"]
@@ -178,7 +177,6 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
                 full_high.loc[pre_mask] = full_close.loc[pre_mask] * (1.0 + hl_spread.loc[pre_mask] * 0.5)
                 full_low.loc[pre_mask] = full_close.loc[pre_mask] * (1.0 - hl_spread.loc[pre_mask] * 0.5)
         else:
-            # ETF実データが完全に存在しない場合は全期間合成
             full_close = 100.0 * cum_growth
             hl_spread = ((df_u["High"] - df_u["Low"]) / np.maximum(df_u["Close"], EPSILON)) * lev
             full_high = full_close * (1.0 + hl_spread * 0.5)
@@ -208,7 +206,6 @@ def get_usdjpy_rate() -> float:
         pass
     return 155.0
 
-# データ初期化
 with st.spinner(f"市場データ（{selected_period_label}）を取得・同期解析中..."):
     try:
         market_data, common_idx = load_and_sync_market_data(period_code)
@@ -220,26 +217,24 @@ with st.spinner(f"市場データ（{selected_period_label}）を取得・同期
 latest_date_str = common_idx[-1].strftime('%Y年%m月%d日')
 
 # =============================================================
-# 4. 高速クオンツシグナル解析エンジン
+# 4. 高速クオンツシグナル解析エンジン（案A適用）
 # =============================================================
 def calc_parkinson_vol_vectorized(df: pd.DataFrame, window: int = 10) -> np.ndarray:
-    """Parkinson極値ボラティリティのベクトル計算（高速化・NaN安全処理）"""
+    """Parkinson極値ボラティリティのベクトル計算"""
     h = np.maximum(df["High"].values, EPSILON)
     l = np.maximum(df["Low"].values, EPSILON)
     hl_ratio_sq = (np.log(h / l)) ** 2
     factor = 1.0 / (4.0 * np.log(2.0))
-    # 移動平均をNumPy畳み込み/Pandasで高速計算
     rolling_var = pd.Series(hl_ratio_sq * factor).rolling(window=window, min_periods=1).mean().values
     pv = np.sqrt(np.maximum(rolling_var, 0.0)) * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
     return np.where(np.isnan(pv), 20.0, pv)
 
-def calc_rsi_vectorized(series: pd.Series, period: int = 9) -> np.ndarray:
-    """Wilder法に基づく修正RSIの完全ベクトル計算"""
+def calc_rsi_vectorized(series: pd.Series, period: int = RSI_PERIOD) -> np.ndarray:
+    """Wilder法に基づく修正RSIのベクトル計算"""
     delta = series.diff().values
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
 
-    # 指数平滑移動平均 (Wilder's alpha = 1 / period)
     alpha = 1.0 / period
     avg_gain = pd.Series(gain).ewm(alpha=alpha, adjust=False).mean().values
     avg_loss = pd.Series(loss).ewm(alpha=alpha, adjust=False).mean().values
@@ -273,13 +268,13 @@ def run_asset_signals(sym: str) -> Dict[str, Any]:
     vol_score = -(vol_20 - cfg["u_vol_norm"]) / cfg["u_vol_norm"]
     adjusted_vol_score = np.where(combined_trend < 0, np.minimum(vol_score, 0.0), vol_score)
 
-    # 9日RSI & 過熱ペナルティ
-    rsi9 = calc_rsi_vectorized(pd.Series(c_u), period=9)
-    penalty_rsi = np.where(rsi9 > 70.0, (rsi9 - 70.0) / 20.0, 0.0)
-    penalty_ema = np.where(diff_50 > 0.08, (diff_50 - 0.08) / 0.10, 0.0)
-    overheat_penalty = np.clip(penalty_rsi + penalty_ema, 0.0, 0.60)
+    # 9日RSI & 過熱ペナルティ（案A: 閾値 66.0）
+    rsi9 = calc_rsi_vectorized(pd.Series(c_u), period=RSI_PERIOD)
+    penalty_rsi = np.where(rsi9 > RSI_OVERHEAT_THRESHOLD, (rsi9 - RSI_OVERHEAT_THRESHOLD) / RSI_PENALTY_SCALE, 0.0)
+    penalty_ema = np.where(diff_50 > EMA_DIVERGENCE_THRESHOLD, (diff_50 - EMA_DIVERGENCE_THRESHOLD) / EMA_PENALTY_SCALE, 0.0)
+    overheat_penalty = np.clip(penalty_rsi + penalty_ema, 0.0, MAX_OVERHEAT_PENALTY)
 
-    # シグモイド確率変換（オーバーフロー耐性付与）
+    # シグモイド確率変換
     logit = 6.0 * combined_trend + 1.5 * adjusted_vol_score - 3.5 * overheat_penalty
     logit_clipped = np.clip(logit, -50.0, 50.0)
     p_bull = 1.0 / (1.0 + np.exp(-logit_clipped))
@@ -297,7 +292,7 @@ def run_asset_signals(sym: str) -> Dict[str, Any]:
     w_star = w_star * (1.0 - overheat_penalty)
     w_star = np.where(below_50, 0.0, w_star)
 
-    # フェーズゲート適用
+    # フェーズゲート判定
     factor = np.where(
         (p_bull < 0.35) | (w_star < 0.10),
         0.0,
@@ -362,19 +357,17 @@ signals = {s: run_asset_signals(s) for s in asset_keys}
 # 5. 完全ベクトル化 動的ポートフォリオ配分エンジン
 # =============================================================
 n_days = len(common_idx)
-raw_matrix = np.column_stack([signals[k]["raw_w"] for k in asset_keys])  # shape: (n_days, 5)
+raw_matrix = np.column_stack([signals[k]["raw_w"] for k in asset_keys])
 
-# 動的キャップ・正規化演算のベクトル化
 active_mask = raw_matrix > 0.05
 filtered_matrix = np.where(active_mask, raw_matrix, 0.0)
 sum_weights = np.sum(filtered_matrix, axis=1, keepdims=True)
 
-# 合計が1.0を超える場合は正規化、1.0以下は未投資現金を維持
 norm_scaler = np.maximum(sum_weights, 1.0)
 cand_matrix = filtered_matrix / norm_scaler
 daily_alloc_matrix = np.minimum(cand_matrix, max_cap)
 
-# 前日終値確定配分による翌日執行（ルックアヘッドバイアス排除）
+# 前日終値確定シグナルによる翌日執行（ルックアヘッドバイアス完全排除）
 exec_matrix = np.zeros_like(daily_alloc_matrix)
 exec_matrix[1:] = daily_alloc_matrix[:-1]
 
@@ -386,13 +379,11 @@ strat_daily_ret = np.sum(exec_matrix * ret_matrix, axis=1)
 cash_ratio_daily = np.maximum(0.0, 1.0 - np.sum(exec_matrix, axis=1))
 strat_daily_ret += cash_ratio_daily * daily_cash_rate
 
-# 等金額ベンチマーク
 bm_daily_ret = np.mean(ret_matrix, axis=1)
 
 cum_strat = np.cumprod(1.0 + strat_daily_ret)
 cum_bm = np.cumprod(1.0 + bm_daily_ret)
 
-# パフォーマンス統計指標の安全計算
 years = max(n_days / TRADING_DAYS_PER_YEAR, 0.1)
 strat_cagr = (cum_strat[-1] ** (1.0 / years)) - 1.0
 bm_cagr = (cum_bm[-1] ** (1.0 / years)) - 1.0
@@ -424,10 +415,10 @@ st.title("⚡ SDE-Engine Pro 動的資金配分ダッシュボード")
 st.caption(f"検証範囲: **{selected_period_label}** （計 {n_days} 営業日 ｜ 最終確定: {latest_date_str}）")
 
 with st.expander("📖 【運用・アルゴリズム仕様ガイド】", expanded=False):
-    st.markdown("""
+    st.markdown(f"""
     * **EMA乖離フィルター**: 株価が50日EMA未満に転落した瞬間に即座にリスク資産を遮断（キャッシュ待機）。
-    * **過熱ペナルティ**: 9日RSI > 70、または50日EMA乖離 > +8% で投資比率を最大60%圧縮。天井掴みを防止。
-    * **動的集中 & キャップ**: 有望銘柄に比率を集中させつつ、1銘柄上限（設定値: 50%）で過度な集中リスクを統制。
+    * **早期過熱ペナルティ（案A）**: 9日RSI > **{RSI_OVERHEAT_THRESHOLD:.0f}**、または50日EMA乖離 > +8% で投資比率を最大60%圧縮。天井掴み・急反落を高精度で抑止。
+    * **動的集中 & キャップ**: 有望銘柄に比率を集中させつつ、1銘柄上限（設定値: {max_cap_pct}%）で集中リスクを統制。
     * **キャッシュ待機益**: 投資待機枠は年利3.5%の米ドルMMFで自動複利運用。
     """)
 
@@ -445,7 +436,7 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # -------------------------------------------------------------
-# TAB 1: 今夜の最適配分 ＆ 楽天証券 執行シミュレーター
+# TAB 1: 今夜の最適配分 ＆ 執行シミュレーター
 # -------------------------------------------------------------
 with tab1:
     st.info(f"📌 **判定確定日: {latest_date_str}（NY終値ベース）**")
@@ -464,7 +455,7 @@ with tab1:
             st.write(f"強気確率 $P(\\text{{Bull}})$: **{sig['latest_p']*100:.1f}%**")
             st.progress(float(np.clip(sig["latest_p"], 0.0, 1.0)))
 
-            st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f}")
+            st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (警戒閾値: >{RSI_OVERHEAT_THRESHOLD:.0f})")
             st.caption(f"**50日比:** {sig['latest_diff50']*100:+.1f}% ｜ **200日比:** {sig['latest_diff200']*100:+.1f}%")
             st.caption(f"Parkinson Vol: {sig['latest_sigma']:.1f}%")
 
@@ -605,7 +596,7 @@ with tab2:
     st.plotly_chart(fig_bt, use_container_width=True)
 
 # -------------------------------------------------------------
-# TAB 3: 銘柄別詳細分析
+# TAB 3: 銘柄別詳細分析（案A: 閾値ライン更新）
 # -------------------------------------------------------------
 with tab3:
     st.subheader("📊 個別銘柄トレンド・モメンタム・過熱度分析")
@@ -627,7 +618,7 @@ with tab3:
         row_heights=[0.45, 0.30, 0.25],
         subplot_titles=(
             f"① 母体指数 {u_sym} 終値 ＆ 50日/200日 EMA",
-            f"② 母体指数 9日RSI (買われすぎ: 70 ｜ 売られすぎ: 30)",
+            f"② 母体指数 9日RSI (案A過熱警戒ライン: {RSI_OVERHEAT_THRESHOLD:.0f} ｜ 売られすぎ: 30)",
             f"③ 強気確率 P(Bull) ＆ 目標保有比率 W*"
         )
     )
@@ -649,8 +640,10 @@ with tab3:
         go.Scatter(x=common_idx, y=sig["rsi9"], name="9日 RSI", line=dict(color="#9467bd", width=1.5)),
         row=2, col=1
     )
-    fig_single.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-    fig_single.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    fig_single.add_hline(y=RSI_OVERHEAT_THRESHOLD, line_dash="dash", line_color="red",
+                         annotation_text=f"過熱警戒 ({RSI_OVERHEAT_THRESHOLD:.0f})", row=2, col=1)
+    fig_single.add_hline(y=30, line_dash="dash", line_color="green",
+                         annotation_text="売られすぎ (30)", row=2, col=1)
 
     fig_single.add_trace(
         go.Scatter(x=common_idx, y=sig["p_bull"] * 100, name="強気確率 P(Bull) %", line=dict(color="#1f77b4", width=1.5)),
