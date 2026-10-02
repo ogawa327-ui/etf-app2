@@ -1,11 +1,12 @@
 """
-SDE-Engine Pro v2.2: クオンツ型動的レバレッジETFポートフォリオ管理システム
+SDE-Engine Pro v2.2.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
 【機関投資家・クオンツ水準 厳密検証 ＆ 指標可視化 ＆ Pareto改善 完全版】
-- Look-ahead Biasの完全排除: 確定Closeシグナル → 翌朝Open約定 → 翌々朝Open決済の厳密アライメント
-- 関心の分離（SoC）: 重い機械学習シグナル生成と軽量アロケーションの分離キャッシュによる超高速化
-- 共分散行列の事前計算（Pre-computation）によるPareto探索のO(1)化
+- 期間切替時のキャッシュ不整合（ValueError: Broadcast Shape Mismatch）を完全排除
+- 確定Closeシグナル → 翌朝Open約定 → 翌々朝Open決済の厳密タイムアライメント
+- 重い機械学習シグナル生成と軽量アロケーションの分離キャッシュ設計
+- 共分散行列の事前計算（Pre-computation）によるPareto探索の高速化
 - 取引・ロット管理に基づく真のTrade PF / 勝率集計（最終日未決済ポジションのマーク・トゥ・マーケット対応）
-- ゼロ除算・NaN・例外耐性の完全強化
+- ゼロ除算・NaN・境界条件の完全防護
 """
 
 from dataclasses import dataclass
@@ -59,12 +60,12 @@ ALL_REAL_START_DATE: str = "2010-03-11"
 # 2. UI & サイドバー設定
 # =============================================================
 st.set_page_config(
-    page_title="SDE-Engine Pro v2.2 | 厳密クオンツ検証システム",
+    page_title="SDE-Engine Pro v2.2.1 | 厳密クオンツ検証システム",
     page_icon="⚡",
     layout="wide"
 )
 
-st.sidebar.title("⚡ SDE-Engine Pro v2.2")
+st.sidebar.title("⚡ SDE-Engine Pro v2.2.1")
 st.sidebar.caption("機関投資家水準・厳密OOSクオンツモデル")
 
 st.sidebar.markdown("### 📅 データソース ＆ 期間")
@@ -81,16 +82,16 @@ period_options = {
     "25y (直近25年間・ITバブル含む)": "25y",
     "max (取得可能全期間)": "max"
 }
-selected_period_label = st.sidebar.selectbox("取得期間", list(period_options.keys()), index=2)
+selected_period_label = st.sidebar.selectbox("取得期間", list(period_options.keys()), index=5)
 period_code = period_options[selected_period_label]
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚙️ ポートフォリオ ＆ リスク制御")
 max_cap_pct = st.sidebar.slider("1銘柄あたり絶対投資上限 (%)", 20, 100, 50, 5)
-max_cap = max_cap_pct / 100.0
+max_cap = float(max_cap_pct) / 100.0
 
 target_pf_vol_pct = st.sidebar.slider("目標ポートフォリオ年率Vol (%)", 20, 60, 40, 5)
-target_pf_vol = target_pf_vol_pct / 100.0
+target_pf_vol = float(target_pf_vol_pct) / 100.0
 
 vol_target_mode = st.sidebar.radio("Vol Targeting 方式", ["上限抑制のみ (Cap)", "双方向スケーリング (Targeting)"])
 
@@ -135,7 +136,7 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
             continue
 
     if "SPY" not in raw_data or raw_data["SPY"].empty:
-        raise RuntimeError("基準ベンチマーク (SPY) の取得に失敗しました。ネットワーク接続を確認してください。")
+        raise RuntimeError("基準ベンチマーク (SPY) の取得に失敗しました。時間をおいて再試行してください。")
 
     base_idx = raw_data["SPY"].index
     for u in u_tickers:
@@ -189,7 +190,6 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
             "Open": syn_open, "High": syn_high, "Low": syn_low, "Close": syn_close
         }, index=base_idx)
 
-        # 実データが存在する場合は初日終値でスケールを整合させて接合
         if len(real_idx) > 0:
             df_real = raw_data[sym].loc[real_idx]
             first_real_date = real_idx[0]
@@ -211,6 +211,7 @@ with st.spinner("市場データを取得・検証中..."):
         st.error(f"データ取得エラー: {str(e)}")
         st.stop()
 
+# ユーザー指定のデータ種別による期間スライス
 if period_mode == "実ETFデータ限定（2010年3月〜現在）":
     common_idx = all_base_idx[all_base_idx >= pd.to_datetime(ALL_REAL_START_DATE)]
     if len(common_idx) < 50:
@@ -220,6 +221,7 @@ else:
 
 latest_date_str = common_idx[-1].strftime('%Y年%m月%d日')
 latest_fx = float(fx_rates.loc[common_idx[-1]])
+n_days = len(common_idx)
 
 # =============================================================
 # 4. 特徴量 ＆ Purged Walk-Forward 確率校正エンジン
@@ -245,10 +247,17 @@ def calc_parkinson_vol(df: pd.DataFrame, window: int = 10) -> np.ndarray:
     return np.where(np.isnan(pv), 25.0, pv)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def compute_all_raw_signals(tickers: List[str], base_idx_stamp: str) -> Dict[str, Dict[str, Any]]:
+def compute_all_raw_signals(
+    tickers: List[str],
+    p_code: str,
+    p_mode: str,
+    start_dt_str: str,
+    end_dt_str: str,
+    data_length: int
+) -> Dict[str, Dict[str, Any]]:
     """
     全銘柄のシグナルおよび機械学習推論をキャッシュ化実行。
-    UIスライダー（max_capやtarget_vol）から完全に分離し、不要な再学習を排除する。
+    キャッシュキーにデータ種別・期間・配列長を完全含包し、期間切替時のShape不一致を根本防止。
     """
     results: Dict[str, Dict[str, Any]] = {}
 
@@ -352,7 +361,6 @@ def compute_all_raw_signals(tickers: List[str], base_idx_stamp: str) -> Dict[str
                 logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
                 p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
 
-        # ヒステリシスによる強制弱気防衛
         p_bull = np.where(~hysteresis, np.minimum(p_bull, 0.15), p_bull)
 
         vol_adj = np.clip(cfg.sigma_target / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
@@ -362,7 +370,7 @@ def compute_all_raw_signals(tickers: List[str], base_idx_stamp: str) -> Dict[str
         if not hysteresis[-1]:
             badge, desc = "🔴 弱気防衛 (待機)", "EMA50割れヒステリシス発動 / 全面防衛待機"
         elif overheat_penalty[-1] > 0.15:
-            badge, desc = "⚠️️ 過熱警戒 (抑制)", f"RSI {rsi9[-1]:.1f} (動的閾値 {dyn_rsi_th[-1]:.1f}) 過熱ペナルティ作動"
+            badge, desc = "⚠️ 過熱警戒 (抑制)", f"RSI {rsi9[-1]:.1f} (動的閾値 {dyn_rsi_th[-1]:.1f}) 過熱ペナルティ作動"
         elif p_bull[-1] < 0.55:
             badge, desc = "🟡 探査打診 (抑制配分)", f"打診フェーズ (P(Bull) {p_bull[-1]*100:.1f}%)"
         else:
@@ -383,8 +391,14 @@ def compute_all_raw_signals(tickers: List[str], base_idx_stamp: str) -> Dict[str
     return results
 
 asset_keys = list(ASSETS.keys())
-signals = compute_all_raw_signals(asset_keys, str(common_idx[-1]))
-n_days = len(common_idx)
+signals = compute_all_raw_signals(
+    tickers=asset_keys,
+    p_code=period_code,
+    p_mode=period_mode,
+    start_dt_str=str(common_idx[0]),
+    end_dt_str=str(common_idx[-1]),
+    data_length=n_days
+)
 
 # =============================================================
 # 5. ポートフォリオ最適化 (確信度連動再配分 ＆ Vol Targeting)
@@ -392,18 +406,29 @@ n_days = len(common_idx)
 o_etf_matrix = np.column_stack([signals[k]["o_etf"] for k in asset_keys])
 c_etf_matrix = np.column_stack([signals[k]["c_etf"] for k in asset_keys])
 
+# 防御的アサーション: キャッシュ破損時の自己修復ガード
+if o_etf_matrix.shape[0] != n_days:
+    st.cache_data.clear()
+    st.rerun()
+
 # Open-to-Open 日次リターン
 ret_open_to_open = np.zeros((n_days, len(asset_keys)))
 ret_open_to_open[1:] = (o_etf_matrix[1:] - o_etf_matrix[:-1]) / np.maximum(o_etf_matrix[:-1], EPSILON)
 
-# ローリング共分散行列を事前計算（Pareto探索等の高速化）
 @st.cache_data(ttl=3600, show_spinner=False)
-def precalculate_rolling_cov(rets: np.ndarray, window: int = 60, min_p: int = 20) -> np.ndarray:
+def precalculate_rolling_cov(
+    rets: np.ndarray,
+    cache_tag: str,
+    window: int = 60,
+    min_p: int = 20
+) -> np.ndarray:
+    """ローリング共分散行列を事前計算"""
     n, k = rets.shape
     df_r = pd.DataFrame(rets)
     return df_r.rolling(window, min_periods=min_p).cov().values.reshape(n, k, k) * TRADING_DAYS_PER_YEAR
 
-roll_cov_matrix = precalculate_rolling_cov(ret_open_to_open)
+cov_tag = f"{period_code}_{period_mode}_{n_days}"
+roll_cov_matrix = precalculate_rolling_cov(ret_open_to_open, cov_tag)
 
 def generate_target_allocations(
     raw_signals: Dict[str, Dict[str, Any]],
@@ -495,8 +520,8 @@ def run_rigorous_backtest(
 ):
     """
     【厳密タイムアライメント】
-    t日Close確定後に決定された target_w[t] は、t+1日Openで約定する。
-    t+1日Openで約定したポジションは、t+1日Openからt+2日Openまでのリターンを獲得する。
+    t-1日Closeシグナル target_w[t-1] は、t日Openで約定。
+    t日Openからt+1日Openまでのリターンを獲得。
     """
     n, k = target_w.shape
     strat_net_ret = np.zeros(n)
@@ -507,12 +532,9 @@ def run_rigorous_backtest(
     peak = 1.0
     cum = 1.0
 
-    # トレード追跡管理用構造
     open_trades: Dict[int, Dict[str, Any]] = {}
     completed_trades: List[Dict[str, Any]] = []
 
-    # tは「約定実行日」。t-1日Closeシグナルに基づいてt日Openで約定。
-    # 獲得リターンは t日Open から t+1日Open までの値動き。
     for t in range(1, n - 1):
         w_req = target_w[t - 1].copy()
 
@@ -529,7 +551,6 @@ def run_rigorous_backtest(
         effective_turnover[t] = turnover
         cost = turnover * fee
 
-        # t日Openからt+1日Openまでのリターン
         r_asset_daily = (o_matrix[t + 1] - o_matrix[t]) / np.maximum(o_matrix[t], EPSILON)
         gross_ret = float(np.sum(w_req * r_asset_daily))
         cash_ret = float(max(0.0, 1.0 - np.sum(w_req))) * daily_cash_rate
@@ -545,7 +566,7 @@ def run_rigorous_backtest(
         if cum > peak:
             peak = cum
 
-        # トレード単位損益追跡（Entry〜Exit）
+        # トレード単位損益追跡
         for a_idx in range(k):
             prev_pos = effective_w[t - 1, a_idx]
             curr_pos = w_req[a_idx]
@@ -594,7 +615,6 @@ strat_ret, eff_w, eff_turnover, all_trades = run_rigorous_backtest(
 
 eval_idx = common_idx[:len(strat_ret)]
 
-# ベンチマーク（Daily Equal Weight）の算出
 bm_eq_ret = np.zeros(len(strat_ret))
 for t in range(1, len(strat_ret)):
     r_bm = float(np.mean((o_etf_matrix[t + 1] - o_etf_matrix[t]) / np.maximum(o_etf_matrix[t], EPSILON)))
@@ -662,7 +682,7 @@ tot_cash = max(0.0, 1.0 - tot_inv)
 # =============================================================
 # 7. ダッシュボード・プレゼンテーション層
 # =============================================================
-st.title("⚡ SDE-Engine Pro v2.2 | クオンツ最適化システム")
+st.title("⚡ SDE-Engine Pro v2.2.1 | クオンツ最適化システム")
 st.caption(f"検証モード: **{period_mode}** ｜ 通貨: **{base_currency}** ｜ データ境界確定日: **{latest_date_str}** ({len(eval_idx)}営業日)")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -748,7 +768,7 @@ with tab1:
         fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 発注シミュレータ（初期値300万円）
+    # 発注シミュレータ
     st.markdown("---")
     st.subheader("💡 証券会社 翌朝寄り付き発注シミュレーター")
     curr_c1, curr_c2, curr_c3 = st.columns([1.2, 1.5, 1.3])
@@ -806,7 +826,7 @@ with tab2:
 
     st.markdown("---")
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.2 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.2.1 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
     fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (毎日均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
 
     peak_s = np.maximum.accumulate(cum_strat)
@@ -823,7 +843,7 @@ with tab2:
 
     st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
     perf_data = [
-        {"戦略": "SDE-Engine Pro v2.2", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "真のTrade PF": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
+        {"戦略": "SDE-Engine Pro v2.2.1", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "真のTrade PF": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
         {"戦略": "BM: Equal Weight", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "真のTrade PF": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
     ]
     st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
@@ -975,7 +995,6 @@ with tab6:
     if st.button("🚀 パレート探索を実行 (主要パラメータグリッドスキャン)"):
         with st.spinner("パラメータ空間を高速走査中..."):
             grid_results = []
-            # 18パターンのパラメータ組み合わせスキャン
             for scan_vol in [0.30, 0.40, 0.50]:
                 for scan_cap in [0.35, 0.50, 0.70]:
                     scan_alloc, _ = generate_target_allocations(signals, scan_cap, roll_cov_matrix, scan_vol, False)
