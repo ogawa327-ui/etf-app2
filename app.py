@@ -1,8 +1,9 @@
 """
 SDE-Engine Pro v2.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
-【機関投資家・クオンツ水準 厳密検証 ＆ 指標可視化 完全検証版】
+【機関投資家・クオンツ水準 厳密検証 ＆ 指標可視化 ＆ Pareto改善 完全版】
  - 10日 / 50日 / 200日 移動平均線乖離率の同時表示
  - 主要指標（P(Bull) / RSI / 確信度上限キャップ）の解説Expander
+ - Pareto Frontier: 30秒解説カード、3大おすすめ設定の自動提案、文字重なり解消
  - Look-ahead Biasの完全排除: Purged Walk-Forward OOS シグナル生成
  - 統計的確率校正: CalibratedClassifierCV (Platt Scaling)
  - 翌朝寄り付き(Open)実約定モデル: Open-to-Open
@@ -11,7 +12,6 @@ SDE-Engine Pro v2.1: クオンツ型動的レバレッジETFポートフォリ�
  - DDコントローラー連動の実効Exposure・実効資本効率計算
  - 時系列依存性を保持する Circular Block Bootstrap
  - 円建て(JPY) / ドル建て(USD) 切替
- - 多目的 Pareto Frontier (収益 vs MDD vs CVaR) 探索
 """
 
 from typing import Dict, Tuple, Any, List
@@ -615,7 +615,6 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 with tab1:
     st.info(f"📌 **判定日: {latest_date_str}（終値確定シグナル → 翌朝NY寄り付き執行）**")
 
-    # 1. 主要指標の解説Expander
     with st.expander("ℹ️ 主要クオンツ指標の解説・見方（クリックで開閉）"):
         exp_col1, exp_col2, exp_col3 = st.columns(3)
         with exp_col1:
@@ -639,7 +638,6 @@ with tab1:
 
     st.markdown("---")
 
-    # 2. 各銘柄カード表示
     cols = st.columns(len(asset_keys))
     for idx_c, sym in enumerate(asset_keys):
         sig = signals[sym]
@@ -723,7 +721,7 @@ with tab1:
         })
     c_usd = total_usd * tot_cash
     sim_rows.append({
-        "銘柄": "米ドルMMF / 現金待機", "シグナル判定": "🛡️ 安全待機", "最適配分": f"{tot_cash*100:.1f} %",
+        "銘柄": "米ドルMMF / 現金待機", "シグナル判定": "🛡️️ 安全待機", "最適配分": f"{tot_cash*100:.1f} %",
         "投資目標額 (USD)": f"${c_usd:,.2f}", "概算金額 (JPY)": f"約 {c_usd*latest_fx:,.0f} 円",
         "参考株価": "-", "執行株数": "-", "アクション": "MMF待機 (年利約3.5%)"
     })
@@ -892,11 +890,24 @@ with tab5:
         st.dataframe(pd.DataFrame(stress_list), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
-# TAB 6: 3目的 Pareto Frontier 探索
+# TAB 6: 3目的 Pareto Frontier 探索 (全面改良版)
 # -------------------------------------------------------------
 with tab6:
     st.subheader("💎 3目的 Pareto Frontier (収益 vs MDD vs CVaR) 探索")
-    st.markdown("「最大MDDを○%以内に抑えたとき、OOS CAGRが最大になる設計」を特定するためのパレートフロンティア分析です。")
+
+    # 1. 直感的な図の見方解説カード
+    with st.expander("💡 30秒でわかる！この図の見方・選び方（クリックで開閉）", expanded=True):
+        st.markdown("""
+        **【グラフの重要ルール：一番優秀なのは『左上』にある点です】**
+        * **縦軸（上に行くほど良い）**: 年平均リターン（CAGR）が高く、資産が増えるスピードが速い。
+        * **横軸（左に行くほど良い）**: 最大下落率（MDD）が小さく、暴落時の痛手が浅い（資産が守られる）。
+        * **丸の大きさ（大きいほど良い）**: 下落リスクに対する収益効率（Calmar比率）が高い。
+        * **丸の色（濃い青・紫ほど安全）**: 1日の最大想定損失（日次95% CVaR）が小さく堅牢。
+
+        > **迷ったときの設定選びの目安:**
+        > * **「下落が怖い（最大損失20%以下）」**: 横軸20%より左側の中で、最も上にある点を選択。
+        > * **「下落25%程度まで許容して収益を伸ばしたい」**: 横軸25%付近で最も上に位置する点を選択。
+        """)
 
     if st.button("🚀 パレート探索を実行 (主要パラメータグリッドスキャン)"):
         with st.spinner("パラメータ空間を走査中..."):
@@ -911,8 +922,10 @@ with tab6:
                         r_sc, eff_w_sc, _, tr_sc = run_rigorous_backtest(s_exec, o_etf_matrix, c_etf_matrix, fx_array, fee_rate, scan_dd, use_jpy)
                         m_sc = evaluate_performance(r_sc, eff_w_sc, tr_sc)
                         grid_results.append({
-                            "TargetVol": f"{int(scan_vol*100)}%", "MaxCap": f"{int(scan_cap*100)}%",
+                            "TargetVol": f"{int(scan_vol*100)}%",
+                            "MaxCap": f"{int(scan_cap*100)}%",
                             "DD_Ctrl": "ON" if scan_dd else "OFF",
+                            "設定ラベル": f"Vol {int(scan_vol*100)}% / 上限 {int(scan_cap*100)}% / DD:{'ON' if scan_dd else 'OFF'}",
                             "CAGR": m_sc["CAGR"] * 100.0,
                             "MDD": abs(m_sc["MDD"] * 100.0),
                             "CVaR_95": abs(m_sc["CVaR_95"] * 100.0),
@@ -921,21 +934,90 @@ with tab6:
 
             df_grid = pd.DataFrame(grid_results)
 
+            # 3大おすすめ設定を自動特定
+            best_balanced = df_grid.loc[df_grid["Calmar"].idxmax()]
+            best_safe = df_grid.loc[df_grid["MDD"].idxmin()]
+            best_growth = df_grid.loc[df_grid["CAGR"].idxmax()]
+
+            st.markdown("### 🏆 目的別・推奨おすすめ3大設定")
+            col_b1, col_b2, col_b3 = st.columns(3)
+            with col_b1:
+                st.success(
+                    f"**① 総合バランス最優秀 (Calmar最大)**\n\n"
+                    f"**【{best_balanced['設定ラベル']}】**\n\n"
+                    f"* CAGR: **{best_balanced['CAGR']:.1f}%**\n"
+                    f"* MDD: **-{best_balanced['MDD']:.1f}%**\n"
+                    f"* Calmar比率: **{best_balanced['Calmar']:.2f}**"
+                )
+            with col_b2:
+                st.info(
+                    f"**② 最も安全重視 (下落最小)**\n\n"
+                    f"**【{best_safe['設定ラベル']}】**\n\n"
+                    f"* CAGR: **{best_safe['CAGR']:.1f}%**\n"
+                    f"* MDD: **-{best_safe['MDD']:.1f}%** (最小リスク)\n"
+                    f"* Calmar比率: **{best_safe['Calmar']:.2f}**"
+                )
+            with col_b3:
+                st.warning(
+                    f"**③ 最も収益重視 (リターン最大)**\n\n"
+                    f"**【{best_growth['設定ラベル']}】**\n\n"
+                    f"* CAGR: **{best_growth['CAGR']:.1f}%** (最高益)\n"
+                    f"* MDD: **-{best_growth['MDD']:.1f}%**\n"
+                    f"* Calmar比率: **{best_growth['Calmar']:.2f}**"
+                )
+
+            # 文字重なりを解消し、ホバーで詳細が浮かび上がる散布図
             fig_pareto = go.Figure()
             fig_pareto.add_trace(go.Scatter(
-                x=df_grid["MDD"], y=df_grid["CAGR"],
-                mode="markers+text",
-                marker=dict(size=df_grid["Calmar"]*8, color=df_grid["CVaR_95"], colorscale="Viridis", showscale=True, colorbar=dict(title="日次CVaR (%)")),
-                text=df_grid["TargetVol"] + " / Cap" + df_grid["MaxCap"] + " / DD:" + df_grid["DD_Ctrl"],
-                textposition="top center"
+                x=df_grid["MDD"],
+                y=df_grid["CAGR"],
+                mode="markers",
+                marker=dict(
+                    size=np.clip(df_grid["Calmar"] * 9, 12, 36),
+                    color=df_grid["CVaR_95"],
+                    colorscale="Viridis",
+                    showscale=True,
+                    colorbar=dict(title="日次CVaR (%)"),
+                    line=dict(width=1, color="black")
+                ),
+                text=df_grid["設定ラベル"],
+                customdata=np.stack((df_grid["Calmar"], df_grid["CVaR_95"]), axis=-1),
+                hovertemplate=(
+                    "<b>%{text}</b><br><br>"
+                    "年平均リターン (CAGR): %{y:.1f}%<br>"
+                    "最大下落率 (MDD): -%{x:.1f}%<br>"
+                    "Calmar比率: %{customdata[0]:.2f}<br>"
+                    "日次95% CVaR: %{customdata[1]:.2f}%<extra></extra>"
+                )
             ))
+
+            # おすすめ3点をグラフ上に矢印ハイライト
+            fig_pareto.add_annotation(
+                x=best_balanced["MDD"], y=best_balanced["CAGR"],
+                text="🏆 総合最優秀", showarrow=True, arrowhead=2,
+                arrowsize=1, arrowwidth=2, arrowcolor="#2ecc71", ax=35, ay=-35
+            )
+            fig_pareto.add_annotation(
+                x=best_safe["MDD"], y=best_safe["CAGR"],
+                text="🛡️ 最安全", showarrow=True, arrowhead=2,
+                arrowsize=1, arrowwidth=2, arrowcolor="#3498db", ax=-35, ay=-35
+            )
+            fig_pareto.add_annotation(
+                x=best_growth["MDD"], y=best_growth["CAGR"],
+                text="🚀 最高益", showarrow=True, arrowhead=2,
+                arrowsize=1, arrowwidth=2, arrowcolor="#e67e22", ax=35, ay=35
+            )
+
             fig_pareto.update_layout(
-                title="Pareto 最適空間 (横軸: MDD 抑制, 縦軸: CAGR 拡大, サイズ: Calmar比率)",
-                xaxis_title="最大ドローダウン MDD (%) [小さいほど優秀]",
-                yaxis_title="通算 CAGR (%) [大きいほど優秀]",
-                height=500
+                title="Pareto 最適空間 (左上ほど優秀 ｜ 丸サイズ: Calmar比率)",
+                xaxis_title="最大ドローダウン MDD (%) [← 左ほど下落が小さく安全]",
+                yaxis_title="通算 CAGR (%) [↑ 上ほど収益が高い]",
+                height=520,
+                hovermode="closest"
             )
             st.plotly_chart(fig_pareto, use_container_width=True)
+
+            st.markdown("### 📋 全パラメータ走査結果（Calmar比率 順）")
             st.dataframe(df_grid.sort_values(by="Calmar", ascending=False), use_container_width=True, hide_index=True)
     else:
-        st.info("上のボタンを押すと、パラメータ空間のシミュレーションとPareto最適解の散布図が生成されます。")
+        st.info("上のボタンを押すと、全18通りのパラメータ走査とPareto最適解の散布図が生成されます。")
