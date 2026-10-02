@@ -2,7 +2,7 @@
 SDE-Engine Pro v2.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
 【機関投資家・クオンツ水準 厳密検証 ＆ 指標可視化 完全検証版】
  - 10日 / 50日 / 200日 移動平均線乖離率の同時表示
- - 主要指標（P(Bull) / RSI / 確信度キャップ）の解説Expander
+ - 主要指標（P(Bull) / RSI / 確信度上限キャップ）の解説Expander
  - Look-ahead Biasの完全排除: Purged Walk-Forward OOS シグナル生成
  - 統計的確率校正: CalibratedClassifierCV (Platt Scaling)
  - 翌朝寄り付き(Open)実約定モデル: Open-to-Open
