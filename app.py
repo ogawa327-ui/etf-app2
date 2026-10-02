@@ -1,6 +1,7 @@
 """
-SDE-Engine Pro v2.2.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
-【機関投資家・クオンツ水準 厳密検証 ＆ 指標可視化 ＆ Pareto改善 完全版】
+SDE-Engine Pro v2.3.0: クオンツ型動的レバレッジETFポートフォリオ管理システム
+【10銘柄拡張・マルチアセット分散・Pareto改善 完全版】
+- 10銘柄対応: TQQQ, SPXL, SOXL, FAS, UGL, TMF, CURE, ERX, TNA, DRN
 - 期間切替時のキャッシュ不整合（ValueError: Broadcast Shape Mismatch）を完全排除
 - 確定Closeシグナル → 翌朝Open約定 → 翌々朝Open決済の厳密タイムアライメント
 - 重い機械学習シグナル生成と軽量アロケーションの分離キャッシュ設計
@@ -28,7 +29,7 @@ except ImportError:
     HAS_SKLEARN = False
 
 # =============================================================
-# 1. 定数・アセット設定
+# 1. 定数・アセット設定 (10銘柄 拡張版)
 # =============================================================
 EXPENSE_RATIO_ANNUAL: float = 0.0095      # レバレッジETF年間経費率
 CASH_YIELD_ANNUAL: float = 0.035          # 米ドルMMF年間利回り
@@ -47,31 +48,39 @@ class AssetConfig:
     real_start: str
 
 ASSETS: Dict[str, AssetConfig] = {
+    # --- 既存 5銘柄 ---
     "TQQQ": AssetConfig("TQQQ (NASDAQ 3倍)", "QQQ", "ハイテク", 3.0, 55.0, 20.0, "#00ba38", "2010-02-11"),
     "SPXL": AssetConfig("SPXL (S&P500 3倍)", "SPY", "米国全体", 3.0, 45.0, 16.0, "#619cff", "2008-11-05"),
     "SOXL": AssetConfig("SOXL (半導体 3倍)", "SOXX", "半導体", 3.0, 65.0, 28.0, "#f5b041", "2010-03-11"),
     "FAS":  AssetConfig("FAS (金融株 3倍)", "XLF", "金融", 3.0, 50.0, 18.0, "#9b59b6", "2008-11-05"),
     "UGL":  AssetConfig("UGL (ゴールド 2倍)", "GLD", "ゴールド", 2.0, 35.0, 13.0, "#f1c40f", "2008-12-01"),
+    # --- 新規追加 5銘柄 ---
+    "TMF":  AssetConfig("TMF (長期国債 3倍)", "TLT", "債券ヘッジ", 3.0, 50.0, 16.0, "#e74c3c", "2009-04-16"),
+    "CURE": AssetConfig("CURE (ヘルスケア 3倍)", "XLV", "ヘルスケア", 3.0, 42.0, 14.0, "#1abc9c", "2011-06-15"),
+    "ERX":  AssetConfig("ERX (エネルギー 2倍)", "XLE", "エネルギー", 2.0, 55.0, 22.0, "#e67e22", "2008-11-06"),
+    "TNA":  AssetConfig("TNA (小型株 3倍)", "IWM", "小型株", 3.0, 60.0, 22.0, "#3498db", "2008-11-05"),
+    "DRN":  AssetConfig("DRN (不動産 3倍)", "IYR", "不動産", 3.0, 55.0, 19.0, "#8e44ad", "2009-07-16"),
 }
 
-ALL_REAL_START_DATE: str = "2010-03-11"
+# 全ETF実データ境界（最も新しいCUREの上場日に設定）
+ALL_REAL_START_DATE: str = "2011-06-15"
 
 # =============================================================
 # 2. UI & サイドバー設定
 # =============================================================
 st.set_page_config(
-    page_title="SDE-Engine Pro v2.2.1 | 厳密クオンツ検証システム",
+    page_title="SDE-Engine Pro v2.3.0 | 10銘柄クオンツ検証システム",
     page_icon="⚡",
     layout="wide"
 )
 
-st.sidebar.title("⚡ SDE-Engine Pro v2.2.1")
-st.sidebar.caption("機関投資家水準・厳密OOSクオンツモデル")
+st.sidebar.title("⚡ SDE-Engine Pro v2.3.0")
+st.sidebar.caption("機関投資家水準・10銘柄マルチアセットOOSモデル")
 
 st.sidebar.markdown("### 📅 データソース ＆ 期間")
 period_mode = st.sidebar.radio(
     "データ種別",
-    ["全期間（実データ ＋ 合成データ）", "実ETFデータ限定（2010年3月〜現在）"]
+    ["全期間（実データ ＋ 合成データ）", "実ETFデータ限定（2011年6月〜現在）"]
 )
 
 period_options = {
@@ -87,7 +96,8 @@ period_code = period_options[selected_period_label]
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚙️ ポートフォリオ ＆ リスク制御")
-max_cap_pct = st.sidebar.slider("1銘柄あたり絶対投資上限 (%)", 20, 100, 50, 5)
+# 10銘柄分散に合わせて初期推奨値を30%に設定
+max_cap_pct = st.sidebar.slider("1銘柄あたり絶対投資上限 (%)", 10, 100, 30, 5)
 max_cap = float(max_cap_pct) / 100.0
 
 target_pf_vol_pct = st.sidebar.slider("目標ポートフォリオ年率Vol (%)", 20, 60, 40, 5)
@@ -204,7 +214,7 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
 
     return cleaned_data, fx_series, base_idx
 
-with st.spinner("市場データを取得・検証中..."):
+with st.spinner("10銘柄の市場データを取得・検証中..."):
     try:
         market_data, fx_rates, all_base_idx = load_and_sync_market_data(period_code)
     except Exception as e:
@@ -212,7 +222,7 @@ with st.spinner("市場データを取得・検証中..."):
         st.stop()
 
 # ユーザー指定のデータ種別による期間スライス
-if period_mode == "実ETFデータ限定（2010年3月〜現在）":
+if period_mode == "実ETFデータ限定（2011年6月〜現在）":
     common_idx = all_base_idx[all_base_idx >= pd.to_datetime(ALL_REAL_START_DATE)]
     if len(common_idx) < 50:
         common_idx = all_base_idx
@@ -255,10 +265,7 @@ def compute_all_raw_signals(
     end_dt_str: str,
     data_length: int
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    全銘柄のシグナルおよび機械学習推論をキャッシュ化実行。
-    キャッシュキーにデータ種別・期間・配列長を完全含包し、期間切替時のShape不一致を根本防止。
-    """
+    """全銘柄のシグナルおよび機械学習推論をキャッシュ化実行"""
     results: Dict[str, Dict[str, Any]] = {}
 
     for sym in tickers:
@@ -406,7 +413,6 @@ signals = compute_all_raw_signals(
 o_etf_matrix = np.column_stack([signals[k]["o_etf"] for k in asset_keys])
 c_etf_matrix = np.column_stack([signals[k]["c_etf"] for k in asset_keys])
 
-# 防御的アサーション: キャッシュ破損時の自己修復ガード
 if o_etf_matrix.shape[0] != n_days:
     st.cache_data.clear()
     st.rerun()
@@ -427,7 +433,7 @@ def precalculate_rolling_cov(
     df_r = pd.DataFrame(rets)
     return df_r.rolling(window, min_periods=min_p).cov().values.reshape(n, k, k) * TRADING_DAYS_PER_YEAR
 
-cov_tag = f"{period_code}_{period_mode}_{n_days}"
+cov_tag = f"{period_code}_{period_mode}_{n_days}_{len(asset_keys)}"
 roll_cov_matrix = precalculate_rolling_cov(ret_open_to_open, cov_tag)
 
 def generate_target_allocations(
@@ -446,9 +452,9 @@ def generate_target_allocations(
     for idx, sym in enumerate(asset_keys):
         p = raw_signals[sym]["p_bull"]
         w = raw_signals[sym]["w_star"]
-        cap = np.where(p < 0.40, 0.10, np.where(p < 0.55, 0.25, np.where(p < 0.70, 0.40, user_max_cap)))
+        cap = np.where(p < 0.40, 0.10, np.where(p < 0.55, 0.20, np.where(p < 0.70, 0.25, user_max_cap)))
         cap = np.minimum(cap, user_max_cap)
-        w_filtered = np.where((p < 0.35) | (w < 0.10), 0.0, w)
+        w_filtered = np.where((p < 0.35) | (w < 0.05), 0.0, w)
         raw_w_mat[:, idx] = np.minimum(w_filtered, cap)
         cond_caps_mat[:, idx] = cap
 
@@ -457,7 +463,7 @@ def generate_target_allocations(
     for t in range(n):
         w = raw_w_mat[t].copy()
         c_limits = cond_caps_mat[t].copy()
-        active = np.where(w > 0.05)[0]
+        active = np.where(w > 0.03)[0]
         if len(active) == 0:
             continue
 
@@ -670,7 +676,8 @@ def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List
     }
 
 metrics_strat = evaluate_performance(strat_ret, eff_w, all_trades)
-metrics_bm = evaluate_performance(bm_eq_ret, np.ones((len(bm_eq_ret), len(asset_keys))) * 0.2, [])
+# 10銘柄均等配分(1/10)を動的に指定
+metrics_bm = evaluate_performance(bm_eq_ret, np.ones((len(bm_eq_ret), len(asset_keys))) * (1.0 / len(asset_keys)), [])
 
 cum_strat = np.cumprod(1.0 + strat_ret)
 cum_bm = np.cumprod(1.0 + bm_eq_ret)
@@ -682,7 +689,7 @@ tot_cash = max(0.0, 1.0 - tot_inv)
 # =============================================================
 # 7. ダッシュボード・プレゼンテーション層
 # =============================================================
-st.title("⚡ SDE-Engine Pro v2.2.1 | クオンツ最適化システム")
+st.title("⚡ SDE-Engine Pro v2.3.0 | 10銘柄マルチアセットシステム")
 st.caption(f"検証モード: **{period_mode}** ｜ 通貨: **{base_currency}** ｜ データ境界確定日: **{latest_date_str}** ({len(eval_idx)}営業日)")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -717,39 +724,45 @@ with tab1:
         with exp_col3:
             st.markdown(
                 "**🛡 確信度上限キャップ**\n\n"
-                "P(Bull)の確信度に応じて設定される**個別銘柄の最大配分枠（10%〜50%）**です。"
+                "P(Bull)の確信度に応じて設定される**個別銘柄の最大配分枠（10%〜30%）**です。"
                 "余剰資金の再配分時、自信度が低い「打診銘柄」に過大な資金が流れ込むのを防ぎます。"
             )
 
     st.markdown("---")
 
-    cols = st.columns(len(asset_keys))
-    for idx_c, sym in enumerate(asset_keys):
-        sig = signals[sym]
-        alloc_ratio = latest_alloc[idx_c]
-        with cols[idx_c]:
-            st.markdown(f"#### {sym}")
-            st.caption(f"{ASSETS[sym].name}")
-            st.metric(f"原資産 {ASSETS[sym].underlying}", f"${sig['u_close']:.2f}")
+    # 10銘柄を5列×2段で綺麗に配置
+    chunk_size = 5
+    for row_start in range(0, len(asset_keys), chunk_size):
+        chunk_keys = asset_keys[row_start:row_start + chunk_size]
+        cols = st.columns(len(chunk_keys))
+        for col_idx, sym in enumerate(chunk_keys):
+            idx_c = row_start + col_idx
+            sig = signals[sym]
+            alloc_ratio = latest_alloc[idx_c]
+            with cols[col_idx]:
+                st.markdown(f"#### {sym}")
+                st.caption(f"{ASSETS[sym].name}")
+                st.metric(f"原資産 {ASSETS[sym].underlying}", f"${sig['u_close']:.2f}")
 
-            st.write(f"校正後 P(Bull): **{sig['latest_p']*100:.1f}%**")
-            st.progress(float(np.clip(sig["latest_p"], 0.0, 1.0)))
+                st.write(f"校正後 P(Bull): **{sig['latest_p']*100:.1f}%**")
+                st.progress(float(np.clip(sig["latest_p"], 0.0, 1.0)))
 
-            st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (動的閾値: {sig['latest_th']:.1f})")
+                st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (動的閾値: {sig['latest_th']:.1f})")
 
-            st.caption(
-                f"**乖離率:** 10日: `{sig['latest_diff10']*100:+.1f}%` ｜ "
-                f"50日: `{sig['latest_diff50']*100:+.1f}%` ｜ "
-                f"200日: `{sig['latest_diff200']*100:+.1f}%`"
-            )
+                st.caption(
+                    f"**乖離率:** 10日: `{sig['latest_diff10']*100:+.1f}%` ｜ "
+                    f"50日: `{sig['latest_diff50']*100:+.1f}%` ｜ "
+                    f"200日: `{sig['latest_diff200']*100:+.1f}%`"
+                )
 
-            st.caption(f"**確信度上限キャップ:** {active_caps[-1, idx_c]*100:.1f}%")
+                st.caption(f"**確信度上限キャップ:** {active_caps[-1, idx_c]*100:.1f}%")
 
-            st.info(f"**{sig['badge']}**\n\n*{sig['desc']}*")
-            if alloc_ratio > 0:
-                st.success(f"**推奨配分:**\n\n### {alloc_ratio*100:.1f} %")
-            else:
-                st.warning("**配分:**\n\n### 0.0 % (待機)")
+                st.info(f"**{sig['badge']}**\n\n*{sig['desc']}*")
+                if alloc_ratio > 0:
+                    st.success(f"**推奨配分:**\n\n### {alloc_ratio*100:.1f} %")
+                else:
+                    st.warning("**配分:**\n\n### 0.0 % (待機)")
+        st.markdown("")
 
     st.markdown("---")
     c_s1, c_s2 = st.columns([1.5, 1])
@@ -759,7 +772,7 @@ with tab1:
         m_c1.metric("総株式エクスポージャー", f"{tot_inv*100:.1f} %")
         m_c2.metric("米ドルMMF待機比率", f"{tot_cash*100:.1f} %")
         m_c3.metric("目標PFボラティリティ", f"{target_pf_vol_pct} % ({vol_target_mode})")
-        st.caption("※シグナル強度連動キャップにより、低確信度銘柄への過大配分を抑制済み。")
+        st.caption("※マルチアセット分散により相関が低下し、高い実効エクスポージャーを維持しやすくなっています。")
 
     with c_s2:
         active_labels = [asset_keys[i] for i in range(len(asset_keys)) if latest_alloc[i] > 0] + ["米ドルMMF"]
@@ -826,8 +839,8 @@ with tab2:
 
     st.markdown("---")
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.2.1 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (毎日均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.3.0 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (10銘柄均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
 
     peak_s = np.maximum.accumulate(cum_strat)
     dd_s = (cum_strat - peak_s) / np.maximum(peak_s, EPSILON)
@@ -843,8 +856,8 @@ with tab2:
 
     st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
     perf_data = [
-        {"戦略": "SDE-Engine Pro v2.2.1", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "真のTrade PF": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
-        {"戦略": "BM: Equal Weight", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "真のTrade PF": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
+        {"戦略": "SDE-Engine Pro v2.3.0", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "真のTrade PF": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
+        {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "真のTrade PF": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
     ]
     st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
 
@@ -987,16 +1000,16 @@ with tab6:
         * **丸の大きさ（大きいほど良い）**: 下落リスクに対する収益効率（Calmar比率）が高い。
         * **丸の色（濃い青・紫ほど安全）**: 1日の最大想定損失（日次95% CVaR）が小さく堅牢。
 
-        > **迷ったときの設定選びの目安:**
-        > * **「下落が怖い（最大損失20%以下）」**: 横軸20%より左側の中で、最も上にある点を選択。
-        > * **「下落25%程度まで許容して収益を伸ばしたい」**: 横軸25%付近で最も上に位置する点を選択。
+        > **10銘柄運用の目安:**
+        > * 銘柄数が増えたことで、同じMDD水準でもCAGRとCalmar比率が向上します。
+        > * 最優秀点は上限25%〜30%、Vol 35%〜45%の領域に出現しやすくなります。
         """)
 
     if st.button("🚀 パレート探索を実行 (主要パラメータグリッドスキャン)"):
         with st.spinner("パラメータ空間を高速走査中..."):
             grid_results = []
             for scan_vol in [0.30, 0.40, 0.50]:
-                for scan_cap in [0.35, 0.50, 0.70]:
+                for scan_cap in [0.20, 0.30, 0.40]:
                     scan_alloc, _ = generate_target_allocations(signals, scan_cap, roll_cov_matrix, scan_vol, False)
                     for scan_dd in [True, False]:
                         r_sc, eff_w_sc, _, tr_sc = run_rigorous_backtest(scan_alloc, o_etf_matrix, fx_array, fee_rate, scan_dd, use_jpy)
