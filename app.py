@@ -3,6 +3,7 @@ SDE-Engine Pro v2.1: クオンツ型動的レバレッジETFポートフォリ�
 【機関投資家・クオンツ水準 厳密検証 ＆ 指標可視化 ＆ Pareto改善 完全版】
  - 10日 / 50日 / 200日 移動平均線乖離率の同時表示
  - 主要指標（P(Bull) / RSI / 確信度上限キャップ）の解説Expander
+ - 運用資産初期値: 300万円
  - Pareto Frontier: 30秒解説カード、3大おすすめ設定の自動提案、文字重なり解消
  - Look-ahead Biasの完全排除: Purged Walk-Forward OOS シグナル生成
  - 統計的確率校正: CalibratedClassifierCV (Platt Scaling)
@@ -631,7 +632,7 @@ with tab1:
             )
         with exp_col3:
             st.markdown(
-                "**🛡️ 確信度上限キャップ**\n\n"
+                "**🛡️️ 確信度上限キャップ**\n\n"
                 "P(Bull)の確信度に応じて設定される**個別銘柄の最大配分枠（10%〜50%）**です。"
                 "余剰資金の再配分時、自信度が低い「打診銘柄」に過大な資金が流れ込むのを防ぎます。"
             )
@@ -684,7 +685,7 @@ with tab1:
         fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 発注シミュレータ
+    # 発注シミュレータ（初期値を300万円に設定）
     st.markdown("---")
     st.subheader("💡 証券会社 翌朝寄り付き発注シミュレーター")
     curr_c1, curr_c2, curr_c3 = st.columns([1.2, 1.5, 1.3])
@@ -692,11 +693,11 @@ with tab1:
         in_curr = st.radio("入力通貨", ["日本円 (万円)", "米ドル (USD)"], horizontal=True)
     with curr_c2:
         if in_curr == "日本円 (万円)":
-            f_jpy_man = st.number_input("運用資産総額（万円）", min_value=10, value=500, step=10)
+            f_jpy_man = st.number_input("運用資産総額（万円）", min_value=10, value=300, step=10)
             total_usd = (f_jpy_man * 10000.0) / latest_fx
             total_jpy = f_jpy_man * 10000.0
         else:
-            total_usd = float(st.number_input("運用資産総額 (USD)", min_value=1000, value=30000, step=1000))
+            total_usd = float(st.number_input("運用資産総額 (USD)", min_value=1000, value=20000, step=1000))
             total_jpy = total_usd * latest_fx
     with curr_c3:
         st.metric("最新為替レート (USD/JPY)", f"¥{latest_fx:.2f}")
@@ -721,7 +722,7 @@ with tab1:
         })
     c_usd = total_usd * tot_cash
     sim_rows.append({
-        "銘柄": "米ドルMMF / 現金待機", "シグナル判定": "🛡️️ 安全待機", "最適配分": f"{tot_cash*100:.1f} %",
+        "銘柄": "米ドルMMF / 現金待機", "シグナル判定": "🛡 安全待機", "最適配分": f"{tot_cash*100:.1f} %",
         "投資目標額 (USD)": f"${c_usd:,.2f}", "概算金額 (JPY)": f"約 {c_usd*latest_fx:,.0f} 円",
         "参考株価": "-", "執行株数": "-", "アクション": "MMF待機 (年利約3.5%)"
     })
@@ -999,7 +1000,7 @@ with tab6:
             )
             fig_pareto.add_annotation(
                 x=best_safe["MDD"], y=best_safe["CAGR"],
-                text="🛡️ 最安全", showarrow=True, arrowhead=2,
+                text="🛡 最安全", showarrow=True, arrowhead=2,
                 arrowsize=1, arrowwidth=2, arrowcolor="#3498db", ax=-35, ay=-35
             )
             fig_pareto.add_annotation(
