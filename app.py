@@ -1,8 +1,9 @@
 """
-SDE-Engine Pro v2.3.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
+SDE-Engine Pro v2.3.2: クオンツ型動的レバレッジETFポートフォリオ管理システム
 【10銘柄拡張・マルチアセット分散・Pareto改善 本番運用版】
 
 - 対象10銘柄: TQQQ, SPXL, SOXL, FAS, UGL, TMF, CURE, ERX, TNA, DRN + 米ドルMMF
+- スコープ安全化: ベンチマーク算出の完全ベクトル化によるNameError (未定義変数n) 根絶
 - 厳密タイムアライメント: t-1日Closeシグナル確定 -> t日Open約定 -> t+1日Open評価
 - 純粋関数型設計: グローバル変数を完全排除し、Streamlitキャッシュ不整合を根絶
 - ルックアヘッド・バイアス排除: 5日Embargo付きPurged Walk-Forward確率校正
@@ -67,12 +68,12 @@ ALL_REAL_START_DATE: str = "2011-06-15"
 # 2. UI & サイドバー設定
 # =============================================================
 st.set_page_config(
-    page_title="SDE-Engine Pro v2.3.1 | 10銘柄クオンツ検証システム",
+    page_title="SDE-Engine Pro v2.3.2 | 10銘柄クオンツ検証システム",
     page_icon="⚡",
     layout="wide"
 )
 
-st.sidebar.title("⚡ SDE-Engine Pro v2.3.1")
+st.sidebar.title("⚡ SDE-Engine Pro v2.3.2")
 st.sidebar.caption("機関投資家水準・10銘柄マルチアセット動的配分モデル")
 
 st.sidebar.markdown("### 📅 データソース ＆ 期間")
@@ -115,14 +116,17 @@ def _clean_yf_series(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """MultiIndexおよび欠損カラムを安全に正規化"""
     if df.empty:
         return pd.DataFrame()
-    res = df.copy()
-    if isinstance(res.columns, pd.MultiIndex):
-        if ticker in res.columns.levels[0]:
-            res = res[ticker]
-        elif ticker in res.columns.levels[1]:
-            res = res.xs(ticker, axis=1, level=1)
+    res = pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        if ticker in df.columns.get_level_values(0):
+            res = df[ticker].copy()
+        elif ticker in df.columns.get_level_values(1):
+            res = df.xs(ticker, axis=1, level=1).copy()
         else:
-            res.columns = res.columns.get_level_values(0)
+            return pd.DataFrame()
+    else:
+        res = df.copy()
+
     if res.index.tz is not None:
         res.index = res.index.tz_localize(None)
     for col in ["Open", "High", "Low", "Close"]:
@@ -220,7 +224,6 @@ def load_market_environment(period_str: str) -> Tuple[Dict[str, pd.DataFrame], p
             syn_open_at_date = max(syn_df.loc[first_real_date, "Open"], EPSILON)
             scale = first_real_open / syn_open_at_date
 
-            # 上場日以前の合成データをスケール調整して連続化
             mask_before = syn_df.index < first_real_date
             syn_df.loc[mask_before] *= scale
             for col in ["Open", "High", "Low", "Close"]:
@@ -421,7 +424,6 @@ def calculate_rolling_covariances(rets: np.ndarray, window: int = 60, min_p: int
     n, k = rets.shape
     df_r = pd.DataFrame(rets)
     cov_arr = df_r.rolling(window, min_periods=min_p).cov().values.reshape(n, k, k) * TRADING_DAYS_PER_YEAR
-    # 欠損値は直近単位行列で補完
     for i in range(n):
         if np.isnan(cov_arr[i]).any():
             cov_arr[i] = np.eye(k) * 0.16
@@ -591,7 +593,6 @@ def run_rigorous_backtest(
                 tr = open_trades.pop(a_idx)
                 exit_price = o_matrix[t, a_idx]
                 pnl = (exit_price / max(tr["entry_price"], EPSILON) - 1.0) - (fee * 2.0)
-                # ウェイト加重純損益（ポートフォリオへの実効寄与額比）
                 weighted_pnl = pnl * tr["weight"]
                 completed_trades.append({
                     "asset": asset_keys[a_idx],
@@ -605,7 +606,7 @@ def run_rigorous_backtest(
 
         last_w = w_req.copy()
 
-    # バックテスト最終日での未決済ポジションをマーク・トゥ・マーケット
+    # 最終未決済ポジションのマーク・トゥ・マーケット
     final_t = n - 1
     for a_idx, tr in list(open_trades.items()):
         exit_price = o_matrix[final_t, a_idx]
@@ -633,15 +634,13 @@ strat_ret, eff_w, eff_turnover, all_trades = run_rigorous_backtest(
 # バックテスト評価期間の一致 (t=1 〜 n-2)
 eval_idx = common_idx[1:-1]
 
-bm_eq_ret = np.zeros(len(strat_ret))
-for t in range(1, n - 1):
-    idx_ret = t - 1
-    r_bm = float(np.mean((o_etf_matrix[t + 1] - o_etf_matrix[t]) / np.maximum(o_etf_matrix[t], EPSILON)))
-    if use_jpy:
-        fx_r = (fx_array[t + 1] - fx_array[t]) / max(fx_array[t], EPSILON)
-        bm_eq_ret[idx_ret] = (1.0 + r_bm) * (1.0 + fx_r) - 1.0
-    else:
-        bm_eq_ret[idx_ret] = r_bm
+# ベンチマーク（10銘柄均等配分）の高速ベクトル化算出（NameErrorを完全根絶）
+bm_r = np.mean((o_etf_matrix[2:] - o_etf_matrix[1:-1]) / np.maximum(o_etf_matrix[1:-1], EPSILON), axis=1)
+if use_jpy:
+    fx_r = (fx_array[2:] - fx_array[1:-1]) / np.maximum(fx_array[1:-1], EPSILON)
+    bm_eq_ret = (1.0 + bm_r) * (1.0 + fx_r) - 1.0
+else:
+    bm_eq_ret = bm_r
 
 def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     """クオンツリスク・リターン指標の網羅的算出"""
@@ -671,7 +670,6 @@ def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List
     daily_pf = (np.sum(pos_r) / abs(np.sum(neg_r))) if len(neg_r) > 0 and abs(np.sum(neg_r)) > EPSILON else 0.0
 
     if len(trades) > 0:
-        # ウェイト加重実効損益による真のTrade PF算出
         win_trades = [t["weighted_pnl"] for t in trades if t["weighted_pnl"] > 0]
         loss_trades = [t["weighted_pnl"] for t in trades if t["weighted_pnl"] < 0]
         trade_win_rate = len(win_trades) / len(trades)
@@ -702,7 +700,7 @@ tot_cash = max(0.0, 1.0 - tot_inv)
 # =============================================================
 # 7. ダッシュボード・プレゼンテーション層
 # =============================================================
-st.title("⚡ SDE-Engine Pro v2.3.1 | 10銘柄マルチアセットシステム")
+st.title("⚡ SDE-Engine Pro v2.3.2 | 10銘柄マルチアセットシステム")
 st.caption(f"検証モード: **{period_mode}** ｜ 通貨: **{base_currency}** ｜ データ境界確定日: **{latest_date_str}** ({len(eval_idx)}営業日)")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -850,7 +848,7 @@ with tab2:
 
     st.markdown("---")
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.3.1 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.3.2 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
     fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (10銘柄均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
 
     peak_s = np.maximum.accumulate(cum_strat)
@@ -867,7 +865,7 @@ with tab2:
 
     st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
     perf_data = [
-        {"戦略": "SDE-Engine Pro v2.3.1", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
+        {"戦略": "SDE-Engine Pro v2.3.2", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
         {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "Trade PF (加重)": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
     ]
     st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
@@ -963,7 +961,6 @@ with tab5:
     base_r = strat_ret[-n_steps:]
     n_base = len(base_r)
 
-    # 高速ベクトル化サンプリング
     np.random.seed(42)
     n_blocks = int(np.ceil(n_steps / block_size))
     rand_starts = np.random.randint(0, n_base, size=(n_sims, n_blocks))
@@ -1062,14 +1059,14 @@ with tab6:
                 f"**② 最も安全重視 (下落最小)**\n\n"
                 f"**【{best_safe['設定ラベル']}】**\n\n"
                 f"* CAGR: **{best_safe['CAGR']:.1f}%**\n"
-                f"* MDD: **-{best_safe['MDD']:.1f}%**\n"
+                f"* MDD: **-{best_safe['MDD']:.1f}%** (最小リスク)\n"
                 f"* Calmar比率: **{best_safe['Calmar']:.2f}**"
             )
         with col_b3:
             st.warning(
                 f"**③ 最も収益重視 (リターン最大)**\n\n"
                 f"**【{best_growth['設定ラベル']}】**\n\n"
-                f"* CAGR: **{best_growth['CAGR']:.1f}%**\n"
+                f"* CAGR: **{best_growth['CAGR']:.1f}%** (最高益)\n"
                 f"* MDD: **-{best_growth['MDD']:.1f}%**\n"
                 f"* Calmar比率: **{best_growth['Calmar']:.2f}**"
             )
