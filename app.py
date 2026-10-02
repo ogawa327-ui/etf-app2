@@ -22,7 +22,6 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
-# 機械学習ライブラリのインポート
 try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.calibration import CalibratedClassifierCV
@@ -156,7 +155,6 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
     if len(base_idx) < 60:
         raise ValueError("データ長が不足しています（60営業日未満）。")[cite: 1]
 
-    # 為替レート系列
     if "USDJPY=X" in raw_data and not raw_data["USDJPY=X"].empty:
         fx_series = raw_data["USDJPY=X"]["Close"].reindex(base_idx).ffill().bfill()
     else:
@@ -166,7 +164,6 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
     for u in u_tickers:
         cleaned_data[u] = raw_data[u].loc[base_idx].copy()[cite: 1]
 
-    # OHLC整合合成データ生成
     daily_expense = EXPENSE_RATIO_ANNUAL / TRADING_DAYS_PER_YEAR[cite: 1]
     for sym, cfg in ASSETS.items():
         u_sym = cfg["underlying"][cite: 1]
@@ -307,9 +304,9 @@ def compute_asset_signals_purged(sym: str) -> Dict[str, Any]:
 
     # 3. Purged Walk-Forward 確率予測 & 本物のPlatt Scaling
     p_bull = np.zeros(n)
-    train_win = 252 * 3   # 3年ローリング学習
-    embargo = 5           # 5日先行リターンの重複排除マージン
-    refit_freq = 42       # 約2ヶ月毎にモデル更新
+    train_win = 252 * 3
+    embargo = 5
+    refit_freq = 42
 
     current_model = None
     for t in range(n):
@@ -338,15 +335,12 @@ def compute_asset_signals_purged(sym: str) -> Dict[str, Any]:
             logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
             p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
 
-    # 防衛ライン適用
     p_bull = np.where(~hysteresis, np.minimum(p_bull, 0.15), p_bull)
 
-    # 目標投資比率 W*
     vol_adj = np.clip(cfg["sigma_target"] / np.maximum(sigma_local, 1e-4), 0.2, 1.2)[cite: 1]
     w_star = np.clip(p_bull * vol_adj, 0.0, 1.0) * (1.0 - overheat_penalty)[cite: 1]
     w_star = np.where(~hysteresis, 0.0, w_star)[cite: 1]
 
-    # 確信度に応じた個別最大配分キャップ (過大配分を防止)
     cond_cap = np.where(
         p_bull < 0.40, 0.10,
         np.where(p_bull < 0.55, 0.25,
@@ -356,7 +350,6 @@ def compute_asset_signals_purged(sym: str) -> Dict[str, Any]:
     raw_desired_w = np.where((p_bull < 0.35) | (w_star < 0.10), 0.0, w_star)
     raw_desired_w = np.minimum(raw_desired_w, cond_cap)
 
-    # バッジ情報
     if not hysteresis[-1]:
         badge, desc = "🔴 弱気防衛 (待機)", "EMA50割れヒステリシス発動 / 全面防衛待機"
     elif overheat_penalty[-1] > 0.15:
@@ -410,7 +403,6 @@ def optimize_portfolio_flow(raw_w: np.ndarray, caps: np.ndarray, rets: np.ndarra
         if len(active) == 0:[cite: 1]
             continue[cite: 1]
 
-        # 確信度上限を厳格に保持した逐次再配分
         alloc = np.minimum(w, c_limits)
         pool = 1.0 - np.sum(alloc)
         eligible = [i for i in active if alloc[i] < c_limits[i]]
@@ -435,7 +427,6 @@ def optimize_portfolio_flow(raw_w: np.ndarray, caps: np.ndarray, rets: np.ndarra
             if not hit:[cite: 1]
                 break[cite: 1]
 
-        # ポートフォリオ目標ボラティリティ調整
         cov_t = roll_cov[t][cite: 1]
         if not np.isnan(cov_t).any():[cite: 1]
             pf_var = float(np.dot(alloc.T, np.dot(cov_t, alloc)))[cite: 1]
@@ -504,21 +495,17 @@ def run_rigorous_backtest(exec_w: np.ndarray, o_matrix: np.ndarray, c_matrix: np
         if cum > peak:[cite: 1]
             peak = cum[cite: 1]
 
-        # トレード追跡
         for a_idx in range(k):
             prev_pos = effective_w[t-1, a_idx]
             curr_pos = w_t[a_idx]
 
-            # Entry
             if prev_pos <= 0.01 and curr_pos > 0.01:
                 open_trades[a_idx] = {
                     "entry_t": t, "entry_p": o_matrix[t, a_idx], "weight": curr_pos, "cum_ret": 1.0
                 }
-            # 保有中
             elif curr_pos > 0.01 and a_idx in open_trades:
                 day_r = (o_matrix[t, a_idx] - o_matrix[t-1, a_idx]) / max(o_matrix[t-1, a_idx], EPSILON)
                 open_trades[a_idx]["cum_ret"] *= (1.0 + day_r)
-            # Exit
             elif prev_pos > 0.01 and curr_pos <= 0.01 and a_idx in open_trades:
                 tr = open_trades.pop(a_idx)
                 exit_p = o_matrix[t, a_idx]
@@ -538,7 +525,6 @@ strat_ret, eff_w, eff_turnover, all_trades = run_rigorous_backtest(
     exec_alloc, o_etf_matrix, c_etf_matrix, fx_array, fee_rate, use_dd_controller, use_jpy
 )
 
-# ベンチマーク
 bm_eq_ret = np.zeros(n_days)
 for t in range(1, n_days):
     r_bm = np.mean((o_etf_matrix[t] - o_etf_matrix[t-1]) / np.maximum(o_etf_matrix[t-1], EPSILON))
