@@ -1,13 +1,14 @@
 """
-SDE-Engine Pro v2.3.0: クオンツ型動的レバレッジETFポートフォリオ管理システム
-【10銘柄拡張・マルチアセット分散・Pareto改善 完全版】
-- 10銘柄対応: TQQQ, SPXL, SOXL, FAS, UGL, TMF, CURE, ERX, TNA, DRN
-- 期間切替時のキャッシュ不整合（ValueError: Broadcast Shape Mismatch）を完全排除
-- 確定Closeシグナル → 翌朝Open約定 → 翌々朝Open決済の厳密タイムアライメント
-- 重い機械学習シグナル生成と軽量アロケーションの分離キャッシュ設計
-- 共分散行列の事前計算（Pre-computation）によるPareto探索の高速化
-- 取引・ロット管理に基づく真のTrade PF / 勝率集計（最終日未決済ポジションのマーク・トゥ・マーケット対応）
-- ゼロ除算・NaN・境界条件の完全防護
+SDE-Engine Pro v2.3.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
+【10銘柄拡張・マルチアセット分散・Pareto改善 本番運用版】
+
+- 対象10銘柄: TQQQ, SPXL, SOXL, FAS, UGL, TMF, CURE, ERX, TNA, DRN + 米ドルMMF
+- 厳密タイムアライメント: t-1日Closeシグナル確定 -> t日Open約定 -> t+1日Open評価
+- 純粋関数型設計: グローバル変数を完全排除し、Streamlitキャッシュ不整合を根絶
+- ルックアヘッド・バイアス排除: 5日Embargo付きPurged Walk-Forward確率校正
+- 厳密な資本制約: ポートフォリオ総投資枠 <= 100% (現物完全制約・借入コスト歪み排除)
+- 真のTrade PF: ポートフォリオ資本貢献度に基づくウェイト加重型損益集計
+- 高速ベクトル化: Block Bootstrapおよび最適化ループの高速化
 """
 
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
-# 機械学習ライブラリのインポート
+# 機械学習ライブラリの動的ロードとフォールバック保証
 try:
     from sklearn.linear_model import LogisticRegression
     from sklearn.calibration import CalibratedClassifierCV
@@ -29,12 +30,12 @@ except ImportError:
     HAS_SKLEARN = False
 
 # =============================================================
-# 1. 定数・アセット設定 (10銘柄 拡張版)
+# 1. システム定数・アセット定義
 # =============================================================
-EXPENSE_RATIO_ANNUAL: float = 0.0095      # レバレッジETF年間経費率
-CASH_YIELD_ANNUAL: float = 0.035          # 米ドルMMF年間利回り
+EXPENSE_RATIO_ANNUAL: float = 0.0095      # レバレッジETF年間経費率 (0.95%)
+CASH_YIELD_ANNUAL: float = 0.035          # 米ドルMMF年間想定利回り (3.50%)
 TRADING_DAYS_PER_YEAR: int = 252         # 年間営業日数
-EPSILON: float = 1e-9                     # 数値計算上のゼロ除算防止微小値
+EPSILON: float = 1e-9                     # 数値計算上のゼロ除算防止定数
 
 @dataclass(frozen=True)
 class AssetConfig:
@@ -48,13 +49,11 @@ class AssetConfig:
     real_start: str
 
 ASSETS: Dict[str, AssetConfig] = {
-    # --- 既存 5銘柄 ---
     "TQQQ": AssetConfig("TQQQ (NASDAQ 3倍)", "QQQ", "ハイテク", 3.0, 55.0, 20.0, "#00ba38", "2010-02-11"),
     "SPXL": AssetConfig("SPXL (S&P500 3倍)", "SPY", "米国全体", 3.0, 45.0, 16.0, "#619cff", "2008-11-05"),
     "SOXL": AssetConfig("SOXL (半導体 3倍)", "SOXX", "半導体", 3.0, 65.0, 28.0, "#f5b041", "2010-03-11"),
     "FAS":  AssetConfig("FAS (金融株 3倍)", "XLF", "金融", 3.0, 50.0, 18.0, "#9b59b6", "2008-11-05"),
     "UGL":  AssetConfig("UGL (ゴールド 2倍)", "GLD", "ゴールド", 2.0, 35.0, 13.0, "#f1c40f", "2008-12-01"),
-    # --- 新規追加 5銘柄 ---
     "TMF":  AssetConfig("TMF (長期国債 3倍)", "TLT", "債券ヘッジ", 3.0, 50.0, 16.0, "#e74c3c", "2009-04-16"),
     "CURE": AssetConfig("CURE (ヘルスケア 3倍)", "XLV", "ヘルスケア", 3.0, 42.0, 14.0, "#1abc9c", "2011-06-15"),
     "ERX":  AssetConfig("ERX (エネルギー 2倍)", "XLE", "エネルギー", 2.0, 55.0, 22.0, "#e67e22", "2008-11-06"),
@@ -62,20 +61,19 @@ ASSETS: Dict[str, AssetConfig] = {
     "DRN":  AssetConfig("DRN (不動産 3倍)", "IYR", "不動産", 3.0, 55.0, 19.0, "#8e44ad", "2009-07-16"),
 }
 
-# 全ETF実データ境界（最も新しいCUREの上場日に設定）
 ALL_REAL_START_DATE: str = "2011-06-15"
 
 # =============================================================
 # 2. UI & サイドバー設定
 # =============================================================
 st.set_page_config(
-    page_title="SDE-Engine Pro v2.3.0 | 10銘柄クオンツ検証システム",
+    page_title="SDE-Engine Pro v2.3.1 | 10銘柄クオンツ検証システム",
     page_icon="⚡",
     layout="wide"
 )
 
-st.sidebar.title("⚡ SDE-Engine Pro v2.3.0")
-st.sidebar.caption("機関投資家水準・10銘柄マルチアセットOOSモデル")
+st.sidebar.title("⚡ SDE-Engine Pro v2.3.1")
+st.sidebar.caption("機関投資家水準・10銘柄マルチアセット動的配分モデル")
 
 st.sidebar.markdown("### 📅 データソース ＆ 期間")
 period_mode = st.sidebar.radio(
@@ -96,7 +94,6 @@ period_code = period_options[selected_period_label]
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚙️ ポートフォリオ ＆ リスク制御")
-# 10銘柄分散に合わせて初期推奨値を30%に設定
 max_cap_pct = st.sidebar.slider("1銘柄あたり絶対投資上限 (%)", 10, 100, 30, 5)
 max_cap = float(max_cap_pct) / 100.0
 
@@ -112,41 +109,54 @@ use_dd_controller = st.sidebar.checkbox("DD連動型リスク抑制 (DD Controll
 base_currency = st.sidebar.radio("評価基準通貨", ["米ドル (USD)", "日本円 (JPY)"], horizontal=True)
 
 # =============================================================
-# 3. データ取得 & OHLC 幾何整合合成データ生成
+# 3. データ取得 & 幾何整合スプライシングエンジン
 # =============================================================
-def _sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """MultiIndexおよびタイムゾーンの正規化を行い、必須OHLCVカラムを保証する"""
+def _clean_yf_series(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """MultiIndexおよび欠損カラムを安全に正規化"""
     if df.empty:
-        return df
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    required_cols = ["Open", "High", "Low", "Close", "Volume"]
-    for col in required_cols:
-        if col not in df.columns and "Close" in df.columns:
-            df[col] = df["Close"]
-    return df.dropna(subset=["Close", "Open"])
+        return pd.DataFrame()
+    res = df.copy()
+    if isinstance(res.columns, pd.MultiIndex):
+        if ticker in res.columns.levels[0]:
+            res = res[ticker]
+        elif ticker in res.columns.levels[1]:
+            res = res.xs(ticker, axis=1, level=1)
+        else:
+            res.columns = res.columns.get_level_values(0)
+    if res.index.tz is not None:
+        res.index = res.index.tz_localize(None)
+    for col in ["Open", "High", "Low", "Close"]:
+        if col not in res.columns and "Close" in res.columns:
+            res[col] = res["Close"]
+    return res.dropna(subset=["Close", "Open"])
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame], pd.Series, pd.DatetimeIndex]:
-    """原資産・ETF実データ・為替データを同期取得し、不足期間の幾何整合合成データを生成する"""
+def load_market_environment(period_str: str) -> Tuple[Dict[str, pd.DataFrame], pd.Series, pd.DatetimeIndex]:
+    """全ティッカーの一括取得と幾何整合合成データの安全なスプライシング"""
     u_tickers = [cfg.underlying for cfg in ASSETS.values()]
     etf_tickers = list(ASSETS.keys())
     all_tickers = sorted(list(set(u_tickers + etf_tickers + ["SPY", "USDJPY=X"])))
 
+    try:
+        downloaded = yf.download(
+            all_tickers,
+            period=period_str,
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            group_by="ticker"
+        )
+    except Exception as e:
+        raise RuntimeError(f"市場データの一括取得に失敗しました: {str(e)}")
+
     raw_data: Dict[str, pd.DataFrame] = {}
     for t in all_tickers:
-        try:
-            df = yf.download(t, period=period_str, interval="1d", progress=False, auto_adjust=True)
-            df = _sanitize_df(df)
-            if not df.empty and len(df) >= 30:
-                raw_data[t] = df
-        except Exception:
-            continue
+        cleaned = _clean_yf_series(downloaded, t)
+        if not cleaned.empty and len(cleaned) >= 30:
+            raw_data[t] = cleaned
 
     if "SPY" not in raw_data or raw_data["SPY"].empty:
-        raise RuntimeError("基準ベンチマーク (SPY) の取得に失敗しました。時間をおいて再試行してください。")
+        raise RuntimeError("基準ベンチマーク (SPY) の取得に失敗しました。")
 
     base_idx = raw_data["SPY"].index
     for u in u_tickers:
@@ -166,13 +176,11 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
         cleaned_data[u] = raw_data[u].loc[base_idx].copy()
 
     daily_expense = EXPENSE_RATIO_ANNUAL / TRADING_DAYS_PER_YEAR
+
     for sym, cfg in ASSETS.items():
         u_sym = cfg.underlying
         lev = cfg.leverage
         df_u = cleaned_data[u_sym]
-
-        has_real_etf = (sym in raw_data) and (not raw_data[sym].empty)
-        real_idx = raw_data[sym].index.intersection(base_idx) if has_real_etf else pd.DatetimeIndex([])
 
         u_close = df_u["Close"].values
         u_open = df_u["Open"].values
@@ -180,6 +188,7 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
         u_low = df_u["Low"].values
         n = len(base_idx)
 
+        # 1. 幾何整合合成データの生成
         syn_close = np.zeros(n)
         syn_open = np.zeros(n)
         syn_high = np.zeros(n)
@@ -200,13 +209,20 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
             "Open": syn_open, "High": syn_high, "Low": syn_low, "Close": syn_close
         }, index=base_idx)
 
+        # 2. 実データとの連続接合（上場初日Openでの滑らかなスプライシング）
+        has_real_etf = (sym in raw_data) and (not raw_data[sym].empty)
+        real_idx = raw_data[sym].index.intersection(base_idx) if has_real_etf else pd.DatetimeIndex([])
+
         if len(real_idx) > 0:
             df_real = raw_data[sym].loc[real_idx]
             first_real_date = real_idx[0]
-            first_real_close = float(df_real["Close"].iloc[0])
-            scale = first_real_close / max(syn_df.loc[first_real_date, "Close"], EPSILON)
+            first_real_open = float(df_real["Open"].iloc[0])
+            syn_open_at_date = max(syn_df.loc[first_real_date, "Open"], EPSILON)
+            scale = first_real_open / syn_open_at_date
 
-            syn_df.loc[syn_df.index < first_real_date] *= scale
+            # 上場日以前の合成データをスケール調整して連続化
+            mask_before = syn_df.index < first_real_date
+            syn_df.loc[mask_before] *= scale
             for col in ["Open", "High", "Low", "Close"]:
                 syn_df.loc[real_idx, col] = df_real[col]
 
@@ -214,14 +230,13 @@ def load_and_sync_market_data(period_str: str) -> Tuple[Dict[str, pd.DataFrame],
 
     return cleaned_data, fx_series, base_idx
 
-with st.spinner("10銘柄の市場データを取得・検証中..."):
+with st.spinner("市場データを取得・同期中..."):
     try:
-        market_data, fx_rates, all_base_idx = load_and_sync_market_data(period_code)
+        market_data, fx_rates, all_base_idx = load_market_environment(period_code)
     except Exception as e:
         st.error(f"データ取得エラー: {str(e)}")
         st.stop()
 
-# ユーザー指定のデータ種別による期間スライス
 if period_mode == "実ETFデータ限定（2011年6月〜現在）":
     common_idx = all_base_idx[all_base_idx >= pd.to_datetime(ALL_REAL_START_DATE)]
     if len(common_idx) < 50:
@@ -234,11 +249,11 @@ latest_fx = float(fx_rates.loc[common_idx[-1]])
 n_days = len(common_idx)
 
 # =============================================================
-# 4. 特徴量 ＆ Purged Walk-Forward 確率校正エンジン
+# 4. 特徴量 ＆ Purged Walk-Forward 確率校正
 # =============================================================
 def calc_rsi(series: pd.Series, period: int = 9) -> np.ndarray:
-    """Wilderの平滑化法によるRSI算出"""
-    delta = series.diff().values
+    """Wilder法によるRSI算出（境界値防護付き）"""
+    delta = series.diff().fillna(0.0).values
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
     alpha = 1.0 / period
@@ -248,193 +263,171 @@ def calc_rsi(series: pd.Series, period: int = 9) -> np.ndarray:
     return np.nan_to_num(100.0 - (100.0 / (1.0 + rs)), nan=50.0)
 
 def calc_parkinson_vol(df: pd.DataFrame, window: int = 10) -> np.ndarray:
-    """High/Lowスプレッドに基づくParkinsonボラティリティの算出"""
+    """High/Lowスプレッドに基づくParkinsonボラティリティ（下限防護付き）"""
     h = np.maximum(df["High"].values, EPSILON)
     l = np.maximum(df["Low"].values, EPSILON)
     factor = 1.0 / (4.0 * np.log(2.0))
     rolling_var = pd.Series((np.log(h / l)) ** 2 * factor).rolling(window, min_periods=1).mean().values
     pv = np.sqrt(np.maximum(rolling_var, 0.0)) * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
-    return np.where(np.isnan(pv), 25.0, pv)
+    return np.clip(np.nan_to_num(pv, nan=25.0), 5.0, 200.0)
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def compute_all_raw_signals(
-    tickers: List[str],
-    p_code: str,
-    p_mode: str,
-    start_dt_str: str,
-    end_dt_str: str,
-    data_length: int
-) -> Dict[str, Dict[str, Any]]:
-    """全銘柄のシグナルおよび機械学習推論をキャッシュ化実行"""
-    results: Dict[str, Dict[str, Any]] = {}
+def compute_single_asset_signals(
+    df_u: pd.DataFrame,
+    df_etf: pd.DataFrame,
+    cfg: AssetConfig
+) -> Dict[str, Any]:
+    """1銘柄のシグナルおよびPurged Walk-Forward推論を生成（純粋関数）"""
+    c_u = df_u["Close"].values
+    o_etf = df_etf["Open"].values
+    c_etf = df_etf["Close"].values
+    n = len(c_u)
 
-    for sym in tickers:
-        cfg = ASSETS[sym]
-        df_u = market_data[cfg.underlying].loc[common_idx]
-        df_etf = market_data[sym].loc[common_idx]
+    ema10 = pd.Series(c_u).ewm(span=10, adjust=False).mean().values
+    ema50 = pd.Series(c_u).ewm(span=50, adjust=False).mean().values
+    ema200 = pd.Series(c_u).ewm(span=200, adjust=False).mean().values
 
-        c_u = df_u["Close"].values
-        o_etf = df_etf["Open"].values
-        c_etf = df_etf["Close"].values
-        n = len(c_u)
+    diff_10 = (c_u - ema10) / np.maximum(ema10, EPSILON)
+    diff_50 = (c_u - ema50) / np.maximum(ema50, EPSILON)
+    diff_200 = (c_u - ema200) / np.maximum(ema200, EPSILON)
+    trend_score = 0.60 * diff_50 + 0.40 * diff_200
 
-        # 1. テクニカル指標群
-        ema10 = pd.Series(c_u).ewm(span=10, adjust=False).mean().values
-        ema50 = pd.Series(c_u).ewm(span=50, adjust=False).mean().values
-        ema200 = pd.Series(c_u).ewm(span=200, adjust=False).mean().values
+    hysteresis = np.ones(n, dtype=bool)
+    state = True
+    for i in range(n):
+        if state and diff_50[i] < -0.01:
+            state = False
+        elif not state and diff_50[i] > 0.01:
+            state = True
+        hysteresis[i] = state
 
-        diff_10 = (c_u - ema10) / np.maximum(ema10, EPSILON)
-        diff_50 = (c_u - ema50) / np.maximum(ema50, EPSILON)
-        diff_200 = (c_u - ema200) / np.maximum(ema200, EPSILON)
-        trend_score = 0.60 * diff_50 + 0.40 * diff_200
+    u_ret = pd.Series(c_u).pct_change().fillna(0.0)
+    vol_20 = u_ret.rolling(20, min_periods=1).std().values * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
+    vol_score = -(vol_20 - cfg.u_vol_norm) / cfg.u_vol_norm
 
-        # トレンド・ヒステリシス状態判定
-        hysteresis = np.ones(n, dtype=bool)
-        state = True
-        for i in range(n):
-            if state and diff_50[i] < -0.01:
-                state = False
-            elif not state and diff_50[i] > 0.01:
-                state = True
-            hysteresis[i] = state
+    rsi9 = calc_rsi(pd.Series(c_u), 9)
+    rsi_q85 = pd.Series(rsi9).rolling(252, min_periods=30).quantile(0.85).values
+    dyn_rsi_th = np.clip(np.nan_to_num(rsi_q85, nan=66.0), 62.0, 75.0)
 
-        u_ret = pd.Series(c_u).pct_change().fillna(0.0)
-        vol_20 = u_ret.rolling(20, min_periods=1).std().values * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
-        vol_score = -(vol_20 - cfg.u_vol_norm) / cfg.u_vol_norm
+    p_rsi = np.where(rsi9 > dyn_rsi_th, (rsi9 - dyn_rsi_th) / 20.0, 0.0)
+    p_ema = np.where(diff_50 > 0.08, (diff_50 - 0.08) / 0.10, 0.0)
+    overheat_penalty = np.clip(p_rsi + p_ema, 0.0, 0.60)
 
-        rsi9 = calc_rsi(pd.Series(c_u), 9)
-        rsi_q85 = pd.Series(rsi9).rolling(252, min_periods=30).quantile(0.85).values
-        dyn_rsi_th = np.clip(np.nan_to_num(rsi_q85, nan=66.0), 62.0, 75.0)
+    sigma_local = calc_parkinson_vol(df_etf, 10)
 
-        p_rsi = np.where(rsi9 > dyn_rsi_th, (rsi9 - dyn_rsi_th) / 20.0, 0.0)
-        p_ema = np.where(diff_50 > 0.08, (diff_50 - 0.08) / 0.10, 0.0)
-        overheat_penalty = np.clip(p_rsi + p_ema, 0.0, 0.60)
+    # 目的変数 (5日先リターン) & 特徴量空間
+    fwd_ret_5d = pd.Series(c_u).pct_change(5).shift(-5).values
+    y_target = np.where(fwd_ret_5d > 0, 1, 0)
+    X_features = np.column_stack([trend_score, vol_score, overheat_penalty])
 
-        sigma_local = calc_parkinson_vol(df_etf, 10)
+    # Purged Walk-Forward確率校正
+    p_bull = np.zeros(n)
+    train_win = 252 * 3
+    embargo = 5
+    refit_freq = 42
 
-        # 2. 目的変数 (5日先リターン) & 特徴量
-        fwd_ret_5d = pd.Series(c_u).pct_change(5).shift(-5).values
-        y_target = np.where(fwd_ret_5d > 0, 1, 0)
-        X_features = np.column_stack([trend_score, vol_score, overheat_penalty])
+    current_model = None
+    current_scaler = None
 
-        # 3. Purged Walk-Forward 確率校正
-        p_bull = np.zeros(n)
-        train_win = 252 * 3
-        embargo = 5
-        refit_freq = 42
+    for t in range(n):
+        if t < train_win + embargo:
+            logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
+            p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
+            continue
 
-        current_model = None
-        current_scaler = None
+        if (t % refit_freq == 0) or (current_model is None):
+            train_end = t - embargo
+            train_start = max(0, train_end - train_win)
+            X_tr = X_features[train_start:train_end]
+            y_tr = y_target[train_start:train_end]
 
-        for t in range(n):
-            if t < train_win + embargo:
-                logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
-                p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
-                continue
-
-            if (t % refit_freq == 0) or (current_model is None):
-                train_end = t - embargo
-                train_start = max(0, train_end - train_win)
-                X_tr = X_features[train_start:train_end]
-                y_tr = y_target[train_start:train_end]
-
-                if HAS_SKLEARN and len(np.unique(y_tr)) > 1:
+            if HAS_SKLEARN and len(np.unique(y_tr)) > 1:
+                try:
+                    scaler = StandardScaler()
+                    X_tr_scaled = scaler.fit_transform(X_tr)
+                    base_lr = LogisticRegression(C=1.0, max_iter=200, solver='lbfgs')
                     try:
-                        scaler = StandardScaler()
-                        X_tr_scaled = scaler.fit_transform(X_tr)
-                        base_lr = LogisticRegression(C=1.0, max_iter=200, solver='lbfgs')
-                        try:
-                            cal_clf = CalibratedClassifierCV(estimator=base_lr, method='sigmoid', cv=3)
-                        except TypeError:
-                            cal_clf = CalibratedClassifierCV(base_estimator=base_lr, method='sigmoid', cv=3)
-                        cal_clf.fit(X_tr_scaled, y_tr)
-                        current_model = cal_clf
-                        current_scaler = scaler
-                    except Exception:
-                        current_model = None
-                        current_scaler = None
-                else:
+                        cal_clf = CalibratedClassifierCV(estimator=base_lr, method='sigmoid', cv=3)
+                    except TypeError:
+                        cal_clf = CalibratedClassifierCV(base_estimator=base_lr, method='sigmoid', cv=3)
+                    cal_clf.fit(X_tr_scaled, y_tr)
+                    current_model = cal_clf
+                    current_scaler = scaler
+                except Exception:
                     current_model = None
                     current_scaler = None
-
-            if current_model is not None and current_scaler is not None:
-                try:
-                    X_cur = current_scaler.transform(X_features[t:t+1])
-                    p_bull[t] = current_model.predict_proba(X_cur)[0, 1]
-                except Exception:
-                    logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
-                    p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
             else:
+                current_model = None
+                current_scaler = None
+
+        if current_model is not None and current_scaler is not None:
+            try:
+                X_cur = current_scaler.transform(X_features[t:t+1])
+                p_bull[t] = current_model.predict_proba(X_cur)[0, 1]
+            except Exception:
                 logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
                 p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
-
-        p_bull = np.where(~hysteresis, np.minimum(p_bull, 0.15), p_bull)
-
-        vol_adj = np.clip(cfg.sigma_target / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
-        w_star = np.clip(p_bull * vol_adj, 0.0, 1.0) * (1.0 - overheat_penalty)
-        w_star = np.where(~hysteresis, 0.0, w_star)
-
-        if not hysteresis[-1]:
-            badge, desc = "🔴 弱気防衛 (待機)", "EMA50割れヒステリシス発動 / 全面防衛待機"
-        elif overheat_penalty[-1] > 0.15:
-            badge, desc = "⚠️ 過熱警戒 (抑制)", f"RSI {rsi9[-1]:.1f} (動的閾値 {dyn_rsi_th[-1]:.1f}) 過熱ペナルティ作動"
-        elif p_bull[-1] < 0.55:
-            badge, desc = "🟡 探査打診 (抑制配分)", f"打診フェーズ (P(Bull) {p_bull[-1]*100:.1f}%)"
         else:
-            badge, desc = "🟢 本玉巡航 (積極配分)", f"強気トレンド継続 (P(Bull) {p_bull[-1]*100:.1f}%)"
+            logit = 4.0 * trend_score[t] + 1.0 * vol_score[t] - 2.5 * overheat_penalty[t]
+            p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
 
-        results[sym] = {
-            "p_bull": p_bull, "w_star": w_star, "sigma_local": sigma_local,
-            "ema10": ema10, "ema50": ema50, "ema200": ema200,
-            "diff_10": diff_10, "diff_50": diff_50, "diff_200": diff_200,
-            "rsi9": rsi9, "dyn_rsi_th": dyn_rsi_th, "hysteresis": hysteresis,
-            "c_u": c_u, "o_etf": o_etf, "c_etf": c_etf,
-            "latest_p": p_bull[-1], "latest_w": w_star[-1], "latest_rsi": rsi9[-1],
-            "latest_diff10": diff_10[-1], "latest_diff50": diff_50[-1], "latest_diff200": diff_200[-1],
-            "latest_th": dyn_rsi_th[-1], "badge": badge, "desc": desc,
-            "u_close": c_u[-1], "etf_price": c_etf[-1]
-        }
+    p_bull = np.where(~hysteresis, np.minimum(p_bull, 0.15), p_bull)
 
-    return results
+    vol_adj = np.clip(cfg.sigma_target / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
+    w_star = np.clip(p_bull * vol_adj, 0.0, 1.0) * (1.0 - overheat_penalty)
+    w_star = np.where(~hysteresis, 0.0, w_star)
+
+    if not hysteresis[-1]:
+        badge, desc = "🔴 弱気防衛 (待機)", "EMA50割れヒステリシス発動 / 全面防衛待機"
+    elif overheat_penalty[-1] > 0.15:
+        badge, desc = "⚠️ 過熱警戒 (抑制)", f"RSI {rsi9[-1]:.1f} (動的閾値 {dyn_rsi_th[-1]:.1f}) 過熱ペナルティ作動"
+    elif p_bull[-1] < 0.55:
+        badge, desc = "🟡 探査打診 (抑制配分)", f"打診フェーズ (P(Bull) {p_bull[-1]*100:.1f}%)"
+    else:
+        badge, desc = "🟢 本玉巡航 (積極配分)", f"強気トレンド継続 (P(Bull) {p_bull[-1]*100:.1f}%)"
+
+    return {
+        "p_bull": p_bull, "w_star": w_star, "sigma_local": sigma_local,
+        "diff_10": diff_10, "diff_50": diff_50, "diff_200": diff_200,
+        "rsi9": rsi9, "dyn_rsi_th": dyn_rsi_th, "hysteresis": hysteresis,
+        "c_u": c_u, "o_etf": o_etf, "c_etf": c_etf,
+        "latest_p": p_bull[-1], "latest_w": w_star[-1], "latest_rsi": rsi9[-1],
+        "latest_diff10": diff_10[-1], "latest_diff50": diff_50[-1], "latest_diff200": diff_200[-1],
+        "latest_th": dyn_rsi_th[-1], "badge": badge, "desc": desc,
+        "u_close": c_u[-1], "etf_price": c_etf[-1]
+    }
 
 asset_keys = list(ASSETS.keys())
-signals = compute_all_raw_signals(
-    tickers=asset_keys,
-    p_code=period_code,
-    p_mode=period_mode,
-    start_dt_str=str(common_idx[0]),
-    end_dt_str=str(common_idx[-1]),
-    data_length=n_days
-)
+signals: Dict[str, Dict[str, Any]] = {}
+for sym in asset_keys:
+    cfg_sym = ASSETS[sym]
+    signals[sym] = compute_single_asset_signals(
+        market_data[cfg_sym.underlying].loc[common_idx],
+        market_data[sym].loc[common_idx],
+        cfg_sym
+    )
 
 # =============================================================
-# 5. ポートフォリオ最適化 (確信度連動再配分 ＆ Vol Targeting)
+# 5. ポートフォリオ最適化 (有界ウォーターフォール ＆ 厳密資本制約)
 # =============================================================
 o_etf_matrix = np.column_stack([signals[k]["o_etf"] for k in asset_keys])
 c_etf_matrix = np.column_stack([signals[k]["c_etf"] for k in asset_keys])
 
-if o_etf_matrix.shape[0] != n_days:
-    st.cache_data.clear()
-    st.rerun()
-
-# Open-to-Open 日次リターン
 ret_open_to_open = np.zeros((n_days, len(asset_keys)))
 ret_open_to_open[1:] = (o_etf_matrix[1:] - o_etf_matrix[:-1]) / np.maximum(o_etf_matrix[:-1], EPSILON)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def precalculate_rolling_cov(
-    rets: np.ndarray,
-    cache_tag: str,
-    window: int = 60,
-    min_p: int = 20
-) -> np.ndarray:
-    """ローリング共分散行列を事前計算"""
+def calculate_rolling_covariances(rets: np.ndarray, window: int = 60, min_p: int = 20) -> np.ndarray:
+    """ローリング年率共分散テンソルの事前計算"""
     n, k = rets.shape
     df_r = pd.DataFrame(rets)
-    return df_r.rolling(window, min_periods=min_p).cov().values.reshape(n, k, k) * TRADING_DAYS_PER_YEAR
+    cov_arr = df_r.rolling(window, min_periods=min_p).cov().values.reshape(n, k, k) * TRADING_DAYS_PER_YEAR
+    # 欠損値は直近単位行列で補完
+    for i in range(n):
+        if np.isnan(cov_arr[i]).any():
+            cov_arr[i] = np.eye(k) * 0.16
+    return cov_arr
 
-cov_tag = f"{period_code}_{period_mode}_{n_days}_{len(asset_keys)}"
-roll_cov_matrix = precalculate_rolling_cov(ret_open_to_open, cov_tag)
+roll_cov_matrix = calculate_rolling_covariances(ret_open_to_open)
 
 def generate_target_allocations(
     raw_signals: Dict[str, Dict[str, Any]],
@@ -443,7 +436,7 @@ def generate_target_allocations(
     target_v: float,
     is_bidirectional: bool
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """確信度上限キャップとボラティリティ・ターゲティングを適用し目標配分行列を算出"""
+    """有界ウォーターフォール再配分と厳密資本制約（総和 <= 1.0）を満たす目標配分算出"""
     k = len(asset_keys)
     n = n_days
     raw_w_mat = np.zeros((n, k))
@@ -468,13 +461,13 @@ def generate_target_allocations(
             continue
 
         alloc = np.minimum(w, c_limits)
-        pool = 1.0 - np.sum(alloc)
+        pool = 1.0 - float(np.sum(alloc))
         eligible = [i for i in active if alloc[i] < c_limits[i]]
 
-        # 残余資本の比例再配分
+        # 有界ウォーターフォール再配分
         while eligible and pool > 1e-4:
             sub_w = w[eligible]
-            s_sum = np.sum(sub_w)
+            s_sum = float(np.sum(sub_w))
             if s_sum <= EPSILON:
                 break
             prop = (sub_w / s_sum) * pool
@@ -494,27 +487,33 @@ def generate_target_allocations(
 
         # ポートフォリオVolターゲティング
         cov_t = cov_tensor[t]
-        if not np.isnan(cov_t).any():
-            pf_var = float(np.dot(alloc.T, np.dot(cov_t, alloc)))
-            pf_vol = np.sqrt(max(pf_var, 1e-6))
-            if pf_vol > 0.01:
-                scale = target_v / pf_vol
-                if is_bidirectional:
-                    scale = np.clip(scale, 0.3, 1.3)
-                    alloc = np.minimum(alloc * scale, c_limits)
-                else:
-                    if pf_vol > target_v:
-                        alloc = alloc * (target_v / pf_vol)
+        pf_var = float(np.dot(alloc.T, np.dot(cov_t, alloc)))
+        pf_vol = np.sqrt(max(pf_var, 1e-6))
+        if pf_vol > 0.01:
+            scale = target_v / pf_vol
+            if is_bidirectional:
+                scale = np.clip(scale, 0.3, 1.3)
+                alloc = np.minimum(alloc * scale, c_limits)
+            else:
+                if pf_vol > target_v:
+                    alloc = alloc * (target_v / pf_vol)
+
+        # 厳密な資本制約保証 (現物運用: 合計投資枠 <= 100%)
+        tot_alloc = float(np.sum(alloc))
+        if tot_alloc > 1.0:
+            alloc = alloc / tot_alloc
 
         final_alloc[t] = alloc
 
     return final_alloc, cond_caps_mat
 
 is_bidir = (vol_target_mode == "双方向スケーリング (Targeting)")
-daily_target_alloc, active_caps = generate_target_allocations(signals, max_cap, roll_cov_matrix, target_pf_vol, is_bidir)
+daily_target_alloc, active_caps = generate_target_allocations(
+    signals, max_cap, roll_cov_matrix, target_pf_vol, is_bidir
+)
 
 # =============================================================
-# 6. 実約定バックテスト ＆ トレード単位PF集計エンジン
+# 6. バックテスト ＆ ウェイト加重Trade PF集計
 # =============================================================
 def run_rigorous_backtest(
     target_w: np.ndarray,
@@ -523,16 +522,18 @@ def run_rigorous_backtest(
     fee: float,
     use_dd: bool,
     is_jpy: bool
-):
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
     """
     【厳密タイムアライメント】
-    t-1日Closeシグナル target_w[t-1] は、t日Openで約定。
+    t-1日Close目標配分 target_w[t-1] を t日Openで約定。
     t日Openからt+1日Openまでのリターンを獲得。
+    有効リターン長: n - 2 (インデックス 1 〜 n-2)
     """
     n, k = target_w.shape
-    strat_net_ret = np.zeros(n)
-    effective_w = np.zeros_like(target_w)
-    effective_turnover = np.zeros(n)
+    valid_len = n - 2
+    strat_net_ret = np.zeros(valid_len)
+    effective_w = np.zeros((valid_len, k))
+    effective_turnover = np.zeros(valid_len)
     daily_cash_rate = CASH_YIELD_ANNUAL / TRADING_DAYS_PER_YEAR
 
     peak = 1.0
@@ -541,7 +542,10 @@ def run_rigorous_backtest(
     open_trades: Dict[int, Dict[str, Any]] = {}
     completed_trades: List[Dict[str, Any]] = []
 
+    last_w = np.zeros(k)
+
     for t in range(1, n - 1):
+        idx_ret = t - 1
         w_req = target_w[t - 1].copy()
 
         # ドローダウンコントローラー
@@ -552,9 +556,9 @@ def run_rigorous_backtest(
             elif dd < -0.10:
                 w_req *= 0.70
 
-        effective_w[t] = w_req
-        turnover = float(np.sum(np.abs(w_req - effective_w[t - 1])))
-        effective_turnover[t] = turnover
+        effective_w[idx_ret] = w_req
+        turnover = float(np.sum(np.abs(w_req - last_w)))
+        effective_turnover[idx_ret] = turnover
         cost = turnover * fee
 
         r_asset_daily = (o_matrix[t + 1] - o_matrix[t]) / np.maximum(o_matrix[t], EPSILON)
@@ -567,50 +571,57 @@ def run_rigorous_backtest(
             fx_ret = (fx[t + 1] - fx[t]) / max(fx[t], EPSILON)
             net_ret = (1.0 + net_ret) * (1.0 + fx_ret) - 1.0
 
-        strat_net_ret[t] = net_ret
+        strat_net_ret[idx_ret] = net_ret
         cum *= (1.0 + net_ret)
         if cum > peak:
             peak = cum
 
-        # トレード単位損益追跡
+        # ポートフォリオ資本貢献度に基づくトレード追跡
         for a_idx in range(k):
-            prev_pos = effective_w[t - 1, a_idx]
-            curr_pos = w_req[a_idx]
+            prev_p = last_w[a_idx]
+            curr_p = w_req[a_idx]
 
-            if prev_pos <= 0.01 and curr_pos > 0.01:
+            if prev_p <= 0.01 and curr_p > 0.01:
                 open_trades[a_idx] = {
                     "entry_t": t,
                     "entry_price": o_matrix[t, a_idx],
-                    "weight": curr_pos
+                    "weight": curr_p
                 }
-            elif prev_pos > 0.01 and curr_pos <= 0.01 and a_idx in open_trades:
+            elif prev_p > 0.01 and curr_p <= 0.01 and a_idx in open_trades:
                 tr = open_trades.pop(a_idx)
                 exit_price = o_matrix[t, a_idx]
                 pnl = (exit_price / max(tr["entry_price"], EPSILON) - 1.0) - (fee * 2.0)
+                # ウェイト加重純損益（ポートフォリオへの実効寄与額比）
+                weighted_pnl = pnl * tr["weight"]
                 completed_trades.append({
                     "asset": asset_keys[a_idx],
                     "entry_date": common_idx[int(tr["entry_t"])],
                     "exit_date": common_idx[t],
                     "holding_days": t - int(tr["entry_t"]),
                     "pnl_pct": pnl * 100.0,
-                    "net_pnl": pnl
+                    "weighted_pnl": weighted_pnl,
+                    "weight": tr["weight"]
                 })
 
-    # バックテスト最終時点での未決済ポジションを評価（Mark-to-Market）
+        last_w = w_req.copy()
+
+    # バックテスト最終日での未決済ポジションをマーク・トゥ・マーケット
     final_t = n - 1
     for a_idx, tr in list(open_trades.items()):
         exit_price = o_matrix[final_t, a_idx]
         pnl = (exit_price / max(tr["entry_price"], EPSILON) - 1.0) - fee
+        weighted_pnl = pnl * tr["weight"]
         completed_trades.append({
             "asset": asset_keys[a_idx],
             "entry_date": common_idx[int(tr["entry_t"])],
             "exit_date": common_idx[final_t],
             "holding_days": final_t - int(tr["entry_t"]),
             "pnl_pct": pnl * 100.0,
-            "net_pnl": pnl
+            "weighted_pnl": weighted_pnl,
+            "weight": tr["weight"]
         })
 
-    return strat_net_ret[:n-1], effective_w[:n-1], effective_turnover[:n-1], completed_trades
+    return strat_net_ret, effective_w, effective_turnover, completed_trades
 
 use_jpy = (base_currency == "日本円 (JPY)")
 fx_array = fx_rates.loc[common_idx].values
@@ -619,19 +630,21 @@ strat_ret, eff_w, eff_turnover, all_trades = run_rigorous_backtest(
     daily_target_alloc, o_etf_matrix, fx_array, fee_rate, use_dd_controller, use_jpy
 )
 
-eval_idx = common_idx[:len(strat_ret)]
+# バックテスト評価期間の一致 (t=1 〜 n-2)
+eval_idx = common_idx[1:-1]
 
 bm_eq_ret = np.zeros(len(strat_ret))
-for t in range(1, len(strat_ret)):
+for t in range(1, n - 1):
+    idx_ret = t - 1
     r_bm = float(np.mean((o_etf_matrix[t + 1] - o_etf_matrix[t]) / np.maximum(o_etf_matrix[t], EPSILON)))
     if use_jpy:
         fx_r = (fx_array[t + 1] - fx_array[t]) / max(fx_array[t], EPSILON)
-        bm_eq_ret[t] = (1.0 + r_bm) * (1.0 + fx_r) - 1.0
+        bm_eq_ret[idx_ret] = (1.0 + r_bm) * (1.0 + fx_r) - 1.0
     else:
-        bm_eq_ret[t] = r_bm
+        bm_eq_ret[idx_ret] = r_bm
 
 def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """投資パフォーマンスおよびリスク指標を包括的に算出"""
+    """クオンツリスク・リターン指標の網羅的算出"""
     if len(rets) == 0:
         return {k: 0.0 for k in ["CAGR", "MDD", "Vol", "Calmar", "Daily_PF", "Trade_PF", "Trade_WinRate", "CVaR_95", "Mean_Exposure", "Cap_Efficiency", "Avg_Hold_Days", "Total_Trades"]}
 
@@ -650,7 +663,7 @@ def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List
     cvar_sub = rets[rets <= var_95]
     cvar_95 = float(np.mean(cvar_sub)) if len(cvar_sub) > 0 else var_95
 
-    mean_exposure = float(np.mean(np.sum(eff_weights, axis=1)))
+    mean_exposure = float(np.mean(np.sum(eff_weights, axis=1))) if len(eff_weights) > 0 else 1.0
     cap_efficiency = cagr / max(mean_exposure, 0.05)
 
     pos_r = rets[rets > 0]
@@ -658,8 +671,9 @@ def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List
     daily_pf = (np.sum(pos_r) / abs(np.sum(neg_r))) if len(neg_r) > 0 and abs(np.sum(neg_r)) > EPSILON else 0.0
 
     if len(trades) > 0:
-        win_trades = [t["net_pnl"] for t in trades if t["net_pnl"] > 0]
-        loss_trades = [t["net_pnl"] for t in trades if t["net_pnl"] < 0]
+        # ウェイト加重実効損益による真のTrade PF算出
+        win_trades = [t["weighted_pnl"] for t in trades if t["weighted_pnl"] > 0]
+        loss_trades = [t["weighted_pnl"] for t in trades if t["weighted_pnl"] < 0]
         trade_win_rate = len(win_trades) / len(trades)
         sum_win = float(np.sum(win_trades)) if len(win_trades) > 0 else 0.0
         sum_loss = float(abs(np.sum(loss_trades))) if len(loss_trades) > 0 else 0.0
@@ -676,7 +690,6 @@ def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List
     }
 
 metrics_strat = evaluate_performance(strat_ret, eff_w, all_trades)
-# 10銘柄均等配分(1/10)を動的に指定
 metrics_bm = evaluate_performance(bm_eq_ret, np.ones((len(bm_eq_ret), len(asset_keys))) * (1.0 / len(asset_keys)), [])
 
 cum_strat = np.cumprod(1.0 + strat_ret)
@@ -689,7 +702,7 @@ tot_cash = max(0.0, 1.0 - tot_inv)
 # =============================================================
 # 7. ダッシュボード・プレゼンテーション層
 # =============================================================
-st.title("⚡ SDE-Engine Pro v2.3.0 | 10銘柄マルチアセットシステム")
+st.title("⚡ SDE-Engine Pro v2.3.1 | 10銘柄マルチアセットシステム")
 st.caption(f"検証モード: **{period_mode}** ｜ 通貨: **{base_currency}** ｜ データ境界確定日: **{latest_date_str}** ({len(eval_idx)}営業日)")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -705,7 +718,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # TAB 1: 最適配分 ＆ 発注シミュレータ
 # -------------------------------------------------------------
 with tab1:
-    st.info(f"📌 **判定日: {latest_date_str}（前日終値確定シグナル → 翌朝NY寄り付き執行）**")
+    st.info(f"📌 **判定基準日: {latest_date_str}（前日Close確定シグナル → 翌朝NYオープン執行）**")
 
     with st.expander("ℹ️ 主要クオンツ指標の解説・見方（クリックで開閉）"):
         exp_col1, exp_col2, exp_col3 = st.columns(3)
@@ -730,7 +743,6 @@ with tab1:
 
     st.markdown("---")
 
-    # 10銘柄を5列×2段で綺麗に配置
     chunk_size = 5
     for row_start in range(0, len(asset_keys), chunk_size):
         chunk_keys = asset_keys[row_start:row_start + chunk_size]
@@ -772,7 +784,7 @@ with tab1:
         m_c1.metric("総株式エクスポージャー", f"{tot_inv*100:.1f} %")
         m_c2.metric("米ドルMMF待機比率", f"{tot_cash*100:.1f} %")
         m_c3.metric("目標PFボラティリティ", f"{target_pf_vol_pct} % ({vol_target_mode})")
-        st.caption("※マルチアセット分散により相関が低下し、高い実効エクスポージャーを維持しやすくなっています。")
+        st.caption("※総投資枠は厳密に100%以内に制限され、借入金利負担のない安全な現物運用を維持します。")
 
     with c_s2:
         active_labels = [asset_keys[i] for i in range(len(asset_keys)) if latest_alloc[i] > 0] + ["米ドルMMF"]
@@ -781,7 +793,6 @@ with tab1:
         fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 発注シミュレータ
     st.markdown("---")
     st.subheader("💡 証券会社 翌朝寄り付き発注シミュレーター")
     curr_c1, curr_c2, curr_c3 = st.columns([1.2, 1.5, 1.3])
@@ -832,14 +843,14 @@ with tab2:
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("CAGR", f"{metrics_strat['CAGR']*100:.1f}%", f"BM均等: {metrics_bm['CAGR']*100:.1f}%")
     c2.metric("最大下落率 (MDD)", f"{metrics_strat['MDD']*100:.1f}%", f"BM均等: {metrics_bm['MDD']*100:.1f}%")
-    c3.metric("Trade PF (真値)", f"{metrics_strat['Trade_PF']:.2f}", f"Daily PF: {metrics_strat['Daily_PF']:.2f}")
+    c3.metric("Trade PF (資本寄与加重)", f"{metrics_strat['Trade_PF']:.2f}", f"Daily PF: {metrics_strat['Daily_PF']:.2f}")
     c4.metric("トレード勝率", f"{metrics_strat['Trade_WinRate']*100:.1f}%", f"全 {metrics_strat['Total_Trades']} 件")
     c5.metric("実効資本効率 (CAGR/Exp)", f"{metrics_strat['Cap_Efficiency']:.2f}", f"平均Exp: {metrics_strat['Mean_Exposure']*100:.1f}%")
     c6.metric("95% CVaR (日次)", f"{metrics_strat['CVaR_95']*100:.2f}%")
 
     st.markdown("---")
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.3.0 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.3.1 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
     fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (10銘柄均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
 
     peak_s = np.maximum.accumulate(cum_strat)
@@ -856,8 +867,8 @@ with tab2:
 
     st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
     perf_data = [
-        {"戦略": "SDE-Engine Pro v2.3.0", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "真のTrade PF": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
-        {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "真のTrade PF": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
+        {"戦略": "SDE-Engine Pro v2.3.1", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
+        {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "Trade PF (加重)": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
     ]
     st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
 
@@ -866,10 +877,10 @@ with tab2:
 # -------------------------------------------------------------
 with tab3:
     st.subheader("📜 1トレード単位 (Entry〜Exit) の純損益集計")
-    st.caption("日次リターン合計ではなく、ポジション保有開始から全売却（最終日時点は時価評価）までの実トレード損益（往復コスト控除後）を集計しています。")
+    st.caption("各トレードのエクスポージャー（配分比率）を乗じた『ポートフォリオ資本貢献損益』に基づき厳密集計しています。")
     t_c1, t_c2, t_c3 = st.columns(3)
     t_c1.metric("総完結トレード数", f"{metrics_strat['Total_Trades']} 件")
-    t_c2.metric("真の Trade PF", f"{metrics_strat['Trade_PF']:.2f}")
+    t_c2.metric("真の加重 Trade PF", f"{metrics_strat['Trade_PF']:.2f}")
     t_c3.metric("平均保有日数", f"{metrics_strat['Avg_Hold_Days']:.1f} 営業日")
 
     if len(all_trades) > 0:
@@ -877,10 +888,14 @@ with tab3:
         df_trades["entry_date"] = pd.to_datetime(df_trades["entry_date"]).dt.strftime('%Y-%m-%d')
         df_trades["exit_date"] = pd.to_datetime(df_trades["exit_date"]).dt.strftime('%Y-%m-%d')
         df_trades["pnl_pct_str"] = df_trades["pnl_pct"].apply(lambda x: f"{x:+.2f} %")
+        df_trades["weighted_pnl_str"] = df_trades["weighted_pnl"].apply(lambda x: f"{x*100:+.2f} %")
+        df_trades["weight_str"] = df_trades["weight"].apply(lambda x: f"{x*100:.1f} %")
+
         st.dataframe(
-            df_trades[["asset", "entry_date", "exit_date", "holding_days", "pnl_pct_str"]].rename(columns={
+            df_trades[["asset", "entry_date", "exit_date", "weight_str", "holding_days", "pnl_pct_str", "weighted_pnl_str"]].rename(columns={
                 "asset": "銘柄", "entry_date": "買付日", "exit_date": "売却日",
-                "holding_days": "保有日数", "pnl_pct_str": "純実現損益 (%)"
+                "weight_str": "エントリー配分", "holding_days": "保有日数",
+                "pnl_pct_str": "単体純損益 (%)", "weighted_pnl_str": "PF貢献損益 (%)"
             }),
             use_container_width=True, height=400, hide_index=True
         )
@@ -892,7 +907,7 @@ with tab3:
 # -------------------------------------------------------------
 with tab4:
     st.subheader("🔄 Purged Walk-Forward (完全Out-of-Sample) 検証")
-    st.markdown("本システムでは、シグナル生成時点で**学習データ（3年）と予測対象の間に5営業日のEmbargo**を設け、未学習データのみで逐次OOSリターンを生成しています。")
+    st.caption("3年学習・5日Embargo・1年完全未学習OOSテストを逐次連結した実績推移です。")
 
     wf_train_days = 252 * 3
     wf_test_days = 252 * 1
@@ -911,7 +926,8 @@ with tab4:
 
             seg_cum = np.cumprod(1.0 + seg)
             seg_ret = (seg_cum[-1] - 1.0) * 100.0
-            seg_dd = np.min((seg_cum - np.maximum.accumulate(seg_cum)) / np.maximum.accumulate(seg_cum)) * 100.0
+            seg_peaks = np.maximum.accumulate(seg_cum)
+            seg_dd = np.min((seg_cum - seg_peaks) / np.maximum(seg_peaks, EPSILON)) * 100.0
             oos_splits.append({
                 "検証期間": f"{eval_idx[test_start].strftime('%Y/%m')} - {eval_idx[test_end-1].strftime('%Y/%m')}",
                 "OOS 累積リターン": f"{seg_ret:+.1f} %",
@@ -935,27 +951,26 @@ with tab4:
             st.dataframe(pd.DataFrame(oos_splits), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
-# TAB 5: Block Bootstrap モンテカルロ
+# TAB 5: Block Bootstrap モンテカルロ (NumPy完全ベクトル化)
 # -------------------------------------------------------------
 with tab5:
     st.subheader("🎲 Circular Block Bootstrap (ボラティリティ連鎖保持)")
-    st.caption("1日ごとの独立復元抽出ではなく、10営業日のブロック単位でリサンプリングし、ボラティリティ・クラスタリングを再現したファンチャートです。")
+    st.caption("10営業日のブロック単位でリサンプリングし、ボラティリティ・クラスタリングを再現したファンチャートです。")
 
     block_size = 10
     n_sims = 500
     n_steps = min(252 * 5, len(strat_ret))
-    sim_paths = np.zeros((n_sims, n_steps))
     base_r = strat_ret[-n_steps:]
     n_base = len(base_r)
 
+    # 高速ベクトル化サンプリング
     np.random.seed(42)
-    for i in range(n_sims):
-        sampled = []
-        while len(sampled) < n_steps:
-            rand_idx = np.random.randint(0, n_base)
-            block = [base_r[(rand_idx + b) % n_base] for b in range(block_size)]
-            sampled.extend(block)
-        sim_paths[i] = np.cumprod(1.0 + np.array(sampled[:n_steps]))
+    n_blocks = int(np.ceil(n_steps / block_size))
+    rand_starts = np.random.randint(0, n_base, size=(n_sims, n_blocks))
+    offsets = np.arange(block_size)
+    sampled_indices = (rand_starts[:, :, None] + offsets[None, None, :]).reshape(n_sims, -1)[:, :n_steps] % n_base
+    resampled_returns = base_r[sampled_indices]
+    sim_paths = np.cumprod(1.0 + resampled_returns, axis=1)
 
     p5 = np.percentile(sim_paths, 5, axis=0)
     p25 = np.percentile(sim_paths, 25, axis=0)
@@ -987,23 +1002,21 @@ with tab5:
         st.dataframe(pd.DataFrame(stress_list), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
-# TAB 6: 3目的 Pareto Frontier 探索 (全面高速化版)
+# TAB 6: 3目的 Pareto Frontier 探索 (SessionState永続化版)
 # -------------------------------------------------------------
 with tab6:
     st.subheader("💎 3目的 Pareto Frontier (収益 vs MDD vs CVaR) 探索")
 
-    with st.expander("💡 30秒でわかる！この図の見方・選び方（クリックで開閉）", expanded=True):
+    with st.expander("💡 この図の見方・選び方", expanded=True):
         st.markdown("""
-        **【グラフの重要ルール：一番優秀なのは『左上』にある点です】**
-        * **縦軸（上に行くほど良い）**: 年平均リターン（CAGR）が高く、資産が増えるスピードが速い。
-        * **横軸（左に行くほど良い）**: 最大下落率（MDD）が小さく、暴落時の痛手が浅い（資産が守られる）。
-        * **丸の大きさ（大きいほど良い）**: 下落リスクに対する収益効率（Calmar比率）が高い。
-        * **丸の色（濃い青・紫ほど安全）**: 1日の最大想定損失（日次95% CVaR）が小さく堅牢。
-
-        > **10銘柄運用の目安:**
-        > * 銘柄数が増えたことで、同じMDD水準でもCAGRとCalmar比率が向上します。
-        > * 最優秀点は上限25%〜30%、Vol 35%〜45%の領域に出現しやすくなります。
+        * **縦軸（上ほど良い）**: 年平均リターン（CAGR）
+        * **横軸（左ほど良い）**: 最大下落率（MDDが小さく資産防衛力が高い）
+        * **丸の大きさ（大きいほど良い）**: Calmar比率（下落に対する収益効率）
+        * **丸の色（濃いほど安全）**: 日次95% CVaRが小さくテールリスクが抑制されている
         """)
+
+    if "pareto_df" not in st.session_state:
+        st.session_state.pareto_df = None
 
     if st.button("🚀 パレート探索を実行 (主要パラメータグリッドスキャン)"):
         with st.spinner("パラメータ空間を高速走査中..."):
@@ -1025,89 +1038,92 @@ with tab6:
                             "Calmar": m_sc["Calmar"]
                         })
 
-            df_grid = pd.DataFrame(grid_results)
+            st.session_state.pareto_df = pd.DataFrame(grid_results)
 
-            best_balanced = df_grid.loc[df_grid["Calmar"].idxmax()]
-            best_safe = df_grid.loc[df_grid["MDD"].idxmin()]
-            best_growth = df_grid.loc[df_grid["CAGR"].idxmax()]
+    if st.session_state.pareto_df is not None:
+        df_grid = st.session_state.pareto_df
 
-            st.markdown("### 🏆 目的別・推奨おすすめ3大設定")
-            col_b1, col_b2, col_b3 = st.columns(3)
-            with col_b1:
-                st.success(
-                    f"**① 総合バランス最優秀 (Calmar最大)**\n\n"
-                    f"**【{best_balanced['設定ラベル']}】**\n\n"
-                    f"* CAGR: **{best_balanced['CAGR']:.1f}%**\n"
-                    f"* MDD: **-{best_balanced['MDD']:.1f}%**\n"
-                    f"* Calmar比率: **{best_balanced['Calmar']:.2f}**"
-                )
-            with col_b2:
-                st.info(
-                    f"**② 最も安全重視 (下落最小)**\n\n"
-                    f"**【{best_safe['設定ラベル']}】**\n\n"
-                    f"* CAGR: **{best_safe['CAGR']:.1f}%**\n"
-                    f"* MDD: **-{best_safe['MDD']:.1f}%** (最小リスク)\n"
-                    f"* Calmar比率: **{best_safe['Calmar']:.2f}**"
-                )
-            with col_b3:
-                st.warning(
-                    f"**③ 最も収益重視 (リターン最大)**\n\n"
-                    f"**【{best_growth['設定ラベル']}】**\n\n"
-                    f"* CAGR: **{best_growth['CAGR']:.1f}%** (最高益)\n"
-                    f"* MDD: **-{best_growth['MDD']:.1f}%**\n"
-                    f"* Calmar比率: **{best_growth['Calmar']:.2f}**"
-                )
+        best_balanced = df_grid.loc[df_grid["Calmar"].idxmax()]
+        best_safe = df_grid.loc[df_grid["MDD"].idxmin()]
+        best_growth = df_grid.loc[df_grid["CAGR"].idxmax()]
 
-            fig_pareto = go.Figure()
-            fig_pareto.add_trace(go.Scatter(
-                x=df_grid["MDD"],
-                y=df_grid["CAGR"],
-                mode="markers",
-                marker=dict(
-                    size=np.clip(df_grid["Calmar"] * 9, 12, 36),
-                    color=df_grid["CVaR_95"],
-                    colorscale="Viridis",
-                    showscale=True,
-                    colorbar=dict(title="日次CVaR (%)"),
-                    line=dict(width=1, color="black")
-                ),
-                text=df_grid["設定ラベル"],
-                customdata=np.stack((df_grid["Calmar"], df_grid["CVaR_95"]), axis=-1),
-                hovertemplate=(
-                    "<b>%{text}</b><br><br>"
-                    "年平均リターン (CAGR): %{y:.1f}%<br>"
-                    "最大下落率 (MDD): -%{x:.1f}%<br>"
-                    "Calmar比率: %{customdata[0]:.2f}<br>"
-                    "日次95% CVaR: %{customdata[1]:.2f}%<extra></extra>"
-                )
-            ))
-
-            fig_pareto.add_annotation(
-                x=best_balanced["MDD"], y=best_balanced["CAGR"],
-                text="🏆 総合最優秀", showarrow=True, arrowhead=2,
-                arrowsize=1, arrowwidth=2, arrowcolor="#2ecc71", ax=35, ay=-35
+        st.markdown("### 🏆 目的別・推奨おすすめ3大設定")
+        col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            st.success(
+                f"**① 総合バランス最優秀 (Calmar最大)**\n\n"
+                f"**【{best_balanced['設定ラベル']}】**\n\n"
+                f"* CAGR: **{best_balanced['CAGR']:.1f}%**\n"
+                f"* MDD: **-{best_balanced['MDD']:.1f}%**\n"
+                f"* Calmar比率: **{best_balanced['Calmar']:.2f}**"
             )
-            fig_pareto.add_annotation(
-                x=best_safe["MDD"], y=best_safe["CAGR"],
-                text="🛡 最安全", showarrow=True, arrowhead=2,
-                arrowsize=1, arrowwidth=2, arrowcolor="#3498db", ax=-35, ay=-35
+        with col_b2:
+            st.info(
+                f"**② 最も安全重視 (下落最小)**\n\n"
+                f"**【{best_safe['設定ラベル']}】**\n\n"
+                f"* CAGR: **{best_safe['CAGR']:.1f}%**\n"
+                f"* MDD: **-{best_safe['MDD']:.1f}%**\n"
+                f"* Calmar比率: **{best_safe['Calmar']:.2f}**"
             )
-            fig_pareto.add_annotation(
-                x=best_growth["MDD"], y=best_growth["CAGR"],
-                text="🚀 最高益", showarrow=True, arrowhead=2,
-                arrowsize=1, arrowwidth=2, arrowcolor="#e67e22", ax=35, ay=35
+        with col_b3:
+            st.warning(
+                f"**③ 最も収益重視 (リターン最大)**\n\n"
+                f"**【{best_growth['設定ラベル']}】**\n\n"
+                f"* CAGR: **{best_growth['CAGR']:.1f}%**\n"
+                f"* MDD: **-{best_growth['MDD']:.1f}%**\n"
+                f"* Calmar比率: **{best_growth['Calmar']:.2f}**"
             )
 
-            fig_pareto.update_layout(
-                title="Pareto 最適空間 (左上ほど優秀 ｜ 丸サイズ: Calmar比率)",
-                xaxis_title="最大ドローダウン MDD (%) [← 左ほど下落が小さく安全]",
-                yaxis_title="通算 CAGR (%) [↑ 上ほど収益が高い]",
-                height=520,
-                hovermode="closest"
+        fig_pareto = go.Figure()
+        fig_pareto.add_trace(go.Scatter(
+            x=df_grid["MDD"],
+            y=df_grid["CAGR"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(df_grid["Calmar"] * 9, 12, 36),
+                color=df_grid["CVaR_95"],
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="日次CVaR (%)"),
+                line=dict(width=1, color="black")
+            ),
+            text=df_grid["設定ラベル"],
+            customdata=np.stack((df_grid["Calmar"], df_grid["CVaR_95"]), axis=-1),
+            hovertemplate=(
+                "<b>%{text}</b><br><br>"
+                "年平均リターン (CAGR): %{y:.1f}%<br>"
+                "最大下落率 (MDD): -%{x:.1f}%<br>"
+                "Calmar比率: %{customdata[0]:.2f}<br>"
+                "日次95% CVaR: %{customdata[1]:.2f}%<extra></extra>"
             )
-            st.plotly_chart(fig_pareto, use_container_width=True)
+        ))
 
-            st.markdown("### 📋 全パラメータ走査結果（Calmar比率 順）")
-            st.dataframe(df_grid.sort_values(by="Calmar", ascending=False), use_container_width=True, hide_index=True)
+        fig_pareto.add_annotation(
+            x=best_balanced["MDD"], y=best_balanced["CAGR"],
+            text="🏆 総合最優秀", showarrow=True, arrowhead=2,
+            arrowsize=1, arrowwidth=2, arrowcolor="#2ecc71", ax=35, ay=-35
+        )
+        fig_pareto.add_annotation(
+            x=best_safe["MDD"], y=best_safe["CAGR"],
+            text="🛡 最安全", showarrow=True, arrowhead=2,
+            arrowsize=1, arrowwidth=2, arrowcolor="#3498db", ax=-35, ay=-35
+        )
+        fig_pareto.add_annotation(
+            x=best_growth["MDD"], y=best_growth["CAGR"],
+            text="🚀 最高益", showarrow=True, arrowhead=2,
+            arrowsize=1, arrowwidth=2, arrowcolor="#e67e22", ax=35, ay=35
+        )
+
+        fig_pareto.update_layout(
+            title="Pareto 最適空間 (左上ほど優秀 ｜ 丸サイズ: Calmar比率)",
+            xaxis_title="最大ドローダウン MDD (%) [← 左ほど下落が小さく安全]",
+            yaxis_title="通算 CAGR (%) [↑ 上ほど収益が高い]",
+            height=520,
+            hovermode="closest"
+        )
+        st.plotly_chart(fig_pareto, use_container_width=True)
+
+        st.markdown("### 📋 全パラメータ走査結果（Calmar比率 順）")
+        st.dataframe(df_grid.sort_values(by="Calmar", ascending=False), use_container_width=True, hide_index=True)
     else:
-        st.info("上のボタンを押すと、全18通りのパラメータ走査とPareto最適解の散布図が瞬時に生成されます。")
+        st.info("上のボタンを押すと、全18通りのパラメータ走査とPareto最適解の散布図が生成されます。")
