@@ -1,6 +1,6 @@
 """
-SDE-Engine Pro v2.4.0: クオンツ型動的レバレッジETFポートフォリオ管理システム
-【Tactical Crash Overlay (TCO) 暴落迎撃エンジン完全統合版】
+SDE-Engine Pro v2.4.1: クオンツ型動的レバレッジETFポートフォリオ管理システム
+【TCO押し目買い進捗可視化 & 運用方針ガイド統合版】
 
 - 対象10銘柄: TQQQ, SPXL, SOXL, FAS, UGL, TMF, CURE, ERX, TNA, DRN + 米ドルMMF
 - デュアル・レジーム設計:
@@ -67,12 +67,12 @@ ALL_REAL_START_DATE: str = "2011-06-15"
 # 2. UI & サイドバー設定
 # =============================================================
 st.set_page_config(
-    page_title="SDE-Engine Pro v2.4.0 | 暴落迎撃TCO統合版",
+    page_title="SDE-Engine Pro v2.4.1 | 暴落迎撃TCO統合システム",
     page_icon="⚡",
     layout="wide"
 )
 
-st.sidebar.title("⚡ SDE-Engine Pro v2.4.0")
+st.sidebar.title("⚡ SDE-Engine Pro v2.4.1")
 st.sidebar.caption("機関投資家水準・デュアルレジーム動的配分モデル")
 
 st.sidebar.markdown("### 📅 データソース ＆ 期間")
@@ -121,7 +121,6 @@ tco_fee_rate = float(tco_fee_bps) / 10000.0
 # 3. データ取得 & 幾何整合スプライシングエンジン
 # =============================================================
 def _clean_yf_series(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """MultiIndexおよび欠損カラムを安全に正規化"""
     if df.empty:
         return pd.DataFrame()
     res = pd.DataFrame()
@@ -144,7 +143,6 @@ def _clean_yf_series(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_market_environment(period_str: str) -> Tuple[Dict[str, pd.DataFrame], pd.Series, pd.DatetimeIndex]:
-    """全ティッカーの一括取得と幾何整合合成データの安全なスプライシング"""
     u_tickers = [cfg.underlying for cfg in ASSETS.values()]
     etf_tickers = list(ASSETS.keys())
     all_tickers = sorted(list(set(u_tickers + etf_tickers + ["SPY", "USDJPY=X"])))
@@ -262,7 +260,6 @@ n_days = len(common_idx)
 # 4. 特徴量 ＆ TCOレジーム ＆ Purged Walk-Forward
 # =============================================================
 def calc_rsi(series: pd.Series, period: int = 9) -> np.ndarray:
-    """Wilder法によるRSI算出（境界値防護付き）"""
     delta = series.diff().fillna(0.0).values
     gain = np.where(delta > 0, delta, 0.0)
     loss = np.where(delta < 0, -delta, 0.0)
@@ -273,7 +270,6 @@ def calc_rsi(series: pd.Series, period: int = 9) -> np.ndarray:
     return np.nan_to_num(100.0 - (100.0 / (1.0 + rs)), nan=50.0)
 
 def calc_parkinson_vol(df: pd.DataFrame, window: int = 10) -> np.ndarray:
-    """High/Lowスプレッドに基づくParkinsonボラティリティ"""
     h = np.maximum(df["High"].values, EPSILON)
     l = np.maximum(df["Low"].values, EPSILON)
     factor = 1.0 / (4.0 * np.log(2.0))
@@ -282,7 +278,6 @@ def calc_parkinson_vol(df: pd.DataFrame, window: int = 10) -> np.ndarray:
     return np.clip(np.nan_to_num(pv, nan=25.0), 5.0, 200.0)
 
 def calc_atr(df: pd.DataFrame, period: int = 10) -> np.ndarray:
-    """Average True Range (ATR) 算出（局所リスク評価用）"""
     h = np.maximum(df["High"].values, EPSILON)
     l = np.maximum(df["Low"].values, EPSILON)
     c = np.maximum(df["Close"].values, EPSILON)
@@ -298,11 +293,6 @@ def compute_market_crash_regime(
     market_data: Dict[str, pd.DataFrame],
     common_idx: pd.DatetimeIndex
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    市場全体のパニック・レジーム判定:
-    1. SPYの長短ボラティリティ比 (5日 ParkVol / 60日 ParkVol)
-    2. 安全資産 (UGL/GLD または TMF/TLT) への逃避フロー (Flight-to-Quality)
-    """
     spy_df = market_data["SPY"].loc[common_idx]
     pv_5 = calc_parkinson_vol(spy_df, window=5)
     pv_60 = calc_parkinson_vol(spy_df, window=60)
@@ -321,17 +311,18 @@ def compute_single_asset_signals(
     df_etf: pd.DataFrame,
     cfg: AssetConfig
 ) -> Dict[str, Any]:
-    """1銘柄の順張りシグナルおよびWalk-Forward推論を生成"""
     c_u = df_u["Close"].values
     o_etf = df_etf["Open"].values
     c_etf = df_etf["Close"].values
     n = len(c_u)
 
     ema10 = pd.Series(c_u).ewm(span=10, adjust=False).mean().values
+    ema20 = pd.Series(c_u).ewm(span=20, adjust=False).mean().values
     ema50 = pd.Series(c_u).ewm(span=50, adjust=False).mean().values
     ema200 = pd.Series(c_u).ewm(span=200, adjust=False).mean().values
 
     diff_10 = (c_u - ema10) / np.maximum(ema10, EPSILON)
+    diff_20 = (c_u - ema20) / np.maximum(ema20, EPSILON)
     diff_50 = (c_u - ema50) / np.maximum(ema50, EPSILON)
     diff_200 = (c_u - ema200) / np.maximum(ema200, EPSILON)
     trend_score = 0.60 * diff_50 + 0.40 * diff_200
@@ -358,6 +349,31 @@ def compute_single_asset_signals(
     overheat_penalty = np.clip(p_rsi + p_ema, 0.0, 0.60)
 
     sigma_local = calc_parkinson_vol(df_etf, 10)
+    u_atr = calc_atr(df_u, 10)
+    cur_u_atr = u_atr[-1]
+    risk_pct_u = (2.5 * cur_u_atr) / max(c_u[-1], EPSILON) * 100.0
+    risk_pct_etf = risk_pct_u * cfg.leverage
+
+    # TCO押し買い進捗診断
+    cond_diff = diff_50[-1] < -0.06
+    cond_rsi = rsi9[-1] < 32.0
+
+    if cond_diff and cond_rsi:
+        tco_badge = "🎯 迎撃スタンバイ (条件2/2達成)"
+        tco_desc = f"50日乖離 {diff_50[-1]*100:.1f}% (基準-6%) ＆ RSI {rsi9[-1]:.1f} (基準32) クリア"
+        tco_status_type = "ready"
+    elif cond_diff:
+        tco_badge = f"⏳ 迎撃準備中 (RSIあと {rsi9[-1]-32.0:.1f}pt)"
+        tco_desc = f"50日乖離クリア ({diff_50[-1]*100:.1f}%) ｜ RSI冷却待ち (現在 {rsi9[-1]:.1f})"
+        tco_status_type = "waiting_rsi"
+    elif cond_rsi:
+        tco_badge = f"⏳ 迎撃準備中 (乖離あと {(diff_50[-1]+0.06)*100:+.1f}%)"
+        tco_desc = f"RSIクリア ({rsi9[-1]:.1f}) ｜ 50日EMA乖離待ち (現在 {diff_50[-1]*100:+.1f}%)"
+        tco_status_type = "waiting_diff"
+    else:
+        tco_badge = "🛡️ 平常圏 (迎撃基準外)"
+        tco_desc = f"乖離 {diff_50[-1]*100:+.1f}% ｜ RSI {rsi9[-1]:.1f}"
+        tco_status_type = "normal"
 
     fwd_ret_5d = pd.Series(c_u).pct_change(5).shift(-5).values
     y_target = np.where(fwd_ret_5d > 0, 1, 0)
@@ -426,12 +442,14 @@ def compute_single_asset_signals(
 
     return {
         "p_bull": p_bull, "w_star": w_star, "sigma_local": sigma_local,
-        "diff_10": diff_10, "diff_50": diff_50, "diff_200": diff_200,
+        "diff_10": diff_10, "diff_20": diff_20, "diff_50": diff_50, "diff_200": diff_200,
         "rsi9": rsi9, "dyn_rsi_th": dyn_rsi_th, "hysteresis": hysteresis,
         "c_u": c_u, "o_etf": o_etf, "c_etf": c_etf,
         "latest_p": p_bull[-1], "latest_w": w_star[-1], "latest_rsi": rsi9[-1],
-        "latest_diff10": diff_10[-1], "latest_diff50": diff_50[-1], "latest_diff200": diff_200[-1],
+        "latest_diff10": diff_10[-1], "latest_diff20": diff_20[-1], "latest_diff50": diff_50[-1], "latest_diff200": diff_200[-1],
         "latest_th": dyn_rsi_th[-1], "badge": badge, "desc": desc,
+        "tco_badge": tco_badge, "tco_desc": tco_desc, "tco_status_type": tco_status_type,
+        "risk_pct_u": risk_pct_u, "risk_pct_etf": risk_pct_etf,
         "u_close": c_u[-1], "etf_price": c_etf[-1]
     }
 
@@ -480,7 +498,6 @@ def generate_hybrid_allocations(
     tco_max_cap: float,
     tco_top_k: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """コア巡航枠（最大 1.0 - tco_max_cap）と TCO迎撃枠の完全動的調和"""
     k = len(asset_keys)
     n = len(common_idx)
 
@@ -572,7 +589,6 @@ def generate_hybrid_allocations(
         z_scores[:, idx] = (c_u - pd.Series(c_u).ewm(span=50).mean().values) / np.maximum(sigma_loc, EPSILON)
 
     for t in range(1, n):
-        market_crash = is_panic[t - 1]
         avail_cash = max(0.0, 1.0 - float(np.sum(core_alloc[t - 1])))
         tco_budget = min(tco_max_cap, avail_cash)
 
@@ -581,14 +597,12 @@ def generate_hybrid_allocations(
 
         candidates = []
         for i in range(k):
-            # 原資産が50日EMAから -6%以上下落 かつ RSI9 < 32
             if diff_50_mat[t - 1, i] < -0.06 and rsi9_mat[t - 1, i] < 32.0:
                 candidates.append((i, z_scores[t - 1, i]))
 
         if not candidates:
             continue
 
-        # Z-Scoreが最も低い（過剰に売り叩かれた）上位銘柄をスナイプ
         candidates.sort(key=lambda x: x[1])
         selected = candidates[:tco_top_k]
 
@@ -668,7 +682,6 @@ def run_hybrid_backtest(
         turnover = float(np.sum(np.abs(w_req - last_w)))
         effective_turnover[idx_ret] = turnover
 
-        # TCO取引とコア取引でスリッページを分別
         tco_turnover = float(np.sum(np.abs(tw_req - (tco_w[t - 2] if t > 1 else 0.0))))
         core_turnover = max(0.0, turnover - tco_turnover)
         cost = (core_turnover * c_fee) + (tco_turnover * t_fee)
@@ -687,7 +700,6 @@ def run_hybrid_backtest(
         if cum > peak:
             peak = cum
 
-        # トレード追跡管理
         for a_idx in range(k):
             sym = asset_keys[a_idx]
             key_tco = f"TCO_{a_idx}"
@@ -728,7 +740,7 @@ def run_hybrid_backtest(
                     "entry_price": o_matrix[t, a_idx], "weight": curr_cw
                 }
             elif prev_cw > 0.01 and curr_cw <= 0.01 and key_core in open_trades:
-                tr = open_trades.pop(key_core)
+                tr = open_trades[key_core]
                 exit_p = o_matrix[t, a_idx]
                 pnl = (exit_p / max(tr["entry_price"], EPSILON) - 1.0) - (c_fee * 2.0)
                 completed_trades.append({
@@ -818,7 +830,7 @@ tot_cash = max(0.0, 1.0 - tot_inv)
 # =============================================================
 # 7. ダッシュボード・プレゼンテーション層
 # =============================================================
-st.title("⚡ SDE-Engine Pro v2.4.0 | 暴落迎撃TCO統合システム")
+st.title("⚡ SDE-Engine Pro v2.4.1 | 暴落迎撃TCO統合システム")
 st.caption(f"検証モード: **{period_mode}** ｜ 通貨: **{base_currency}** ｜ データ境界確定日: **{latest_date_str}** ({len(eval_idx)}営業日)")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -835,6 +847,29 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # -------------------------------------------------------------
 with tab1:
     st.info(f"📌 **判定基準日: {latest_date_str}（前日Close確定シグナル → 翌朝NYオープン執行）**")
+
+    with st.expander("🎯 TCO暴落押し買いモードの運用方針・執行ルール（クリックで開閉）", expanded=True):
+        p_col1, p_col2, p_col3 = st.columns(3)
+        with p_col1:
+            st.markdown(
+                "**1. 発動トリガー (スナイパー選別)**\n\n"
+                "・**原資産50日EMA乖離率 < -6.0%**\n"
+                "・**原資産9日RSI < 32.0 (極度売られすぎ)**\n"
+                "・全10銘柄中、最過剰売却 Z-Score **上位1〜2銘柄のみ** に限定動員（多重被弾を防止）"
+            )
+        with p_col2:
+            st.markdown(
+                "**2. 資金管理 (動的ロット調整)**\n\n"
+                "・MMF待機資金から **最大30%枠** を機動開放\n"
+                "・**ATR動的サイジング**: 原資産10日ATRに基づき、**1トレードの許容リスクを資産全体の1.0%以内** に自動制御（激動時はロット縮小）"
+            )
+        with p_col3:
+            st.markdown(
+                "**3. 手仕舞い ＆ 撤退鉄則**\n\n"
+                "・**利確**: 原資産が **20日EMA到達** または **9日RSI > 50回復** で翌朝Open全決済\n"
+                "・**損切り**: 最高値から原資産 $2.5 \\times \\text{ATR}$ 下落で無条件手仕舞い\n"
+                "・**タイムストップ**: **10営業日** 経過で強制手仕舞い（減価遮断）"
+            )
 
     cur_panic = is_panic_series[-1]
     cur_vol_r = vol_ratio_series[-1]
@@ -873,6 +908,17 @@ with tab1:
                 st.caption(f"**乖離率:** 50日: `{sig['latest_diff50']*100:+.1f}%` ｜ 200日: `{sig['latest_diff200']*100:+.1f}%`")
 
                 st.info(f"**{sig['badge']}**")
+
+                st.markdown("**🎯 TCO押し買い進捗診断:**")
+                if sig["tco_status_type"] == "ready":
+                    st.success(f"**{sig['tco_badge']}**\n\n*{sig['tco_desc']}*")
+                elif sig["tco_status_type"] in ["waiting_rsi", "waiting_diff"]:
+                    st.warning(f"**{sig['tco_badge']}**\n\n*{sig['tco_desc']}*")
+                else:
+                    st.caption(f"**{sig['tco_badge']}** ｜ *{sig['tco_desc']}*")
+
+                st.caption(f"・ATR想定損切り幅: 約 -{sig['risk_pct_etf']:.1f}% (原資産 -{sig['risk_pct_u']:.1f}%)")
+                st.caption(f"・利確目標 (20日EMA): `{sig['latest_diff20']*100:+.1f}%`")
 
                 if t_alloc > 0:
                     st.warning(f"🎯 **TCO迎撃配分: {t_alloc*100:.1f}%**")
@@ -959,7 +1005,7 @@ with tab2:
 
     st.markdown("---")
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.4.0 (TCO迎撃統合版)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.4.1 (TCO統合版)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
     fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (10銘柄均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
 
     peak_s = np.maximum.accumulate(cum_strat)
@@ -976,7 +1022,7 @@ with tab2:
 
     st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
     perf_data = [
-        {"戦略": "SDE-Engine Pro v2.4.0 (TCO統合)", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
+        {"戦略": "SDE-Engine Pro v2.4.1 (TCO統合)", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
         {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "Trade PF (加重)": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
     ]
     st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
@@ -1079,7 +1125,7 @@ with tab4:
             st.dataframe(pd.DataFrame(oos_splits), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
-# TAB 5: Block Bootstrap モンテカルロ (NumPy完全ベクトル化)
+# TAB 5: Block Bootstrap モンテカルロ
 # -------------------------------------------------------------
 with tab5:
     st.subheader("🎲 Circular Block Bootstrap (ボラティリティ連鎖保持)")
