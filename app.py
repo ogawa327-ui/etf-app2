@@ -1,15 +1,14 @@
 """
-SDE-Engine Pro v2.3.2: クオンツ型動的レバレッジETFポートフォリオ管理システム
-【10銘柄拡張・マルチアセット分散・Pareto改善 本番運用版】
+SDE-Engine Pro v2.4.0: クオンツ型動的レバレッジETFポートフォリオ管理システム
+【Tactical Crash Overlay (TCO) 暴落迎撃エンジン完全統合版】
 
 - 対象10銘柄: TQQQ, SPXL, SOXL, FAS, UGL, TMF, CURE, ERX, TNA, DRN + 米ドルMMF
-- スコープ安全化: ベンチマーク算出の完全ベクトル化によるNameError (未定義変数n) 根絶
+- デュアル・レジーム設計:
+  1. CORE巡航エンジン: Purged Walk-Forward確率校正 + EMA50ヒステリシス + 動的RSI過熱抑制
+  2. TCO迎撃エンジン: SPY長短Vol比 (タームストラクチャー) + 質への逃避フロー検知 + ATR動的サイジング
 - 厳密タイムアライメント: t-1日Closeシグナル確定 -> t日Open約定 -> t+1日Open評価
-- 純粋関数型設計: グローバル変数を完全排除し、Streamlitキャッシュ不整合を根絶
-- ルックアヘッド・バイアス排除: 5日Embargo付きPurged Walk-Forward確率校正
-- 厳密な資本制約: ポートフォリオ総投資枠 <= 100% (現物完全制約・借入コスト歪み排除)
-- 真のTrade PF: ポートフォリオ資本貢献度に基づくウェイト加重型損益集計
-- 高速ベクトル化: Block Bootstrapおよび最適化ループの高速化
+- 独立サテライト枠: コア最大70% + TCO最大30% (現物完全制約・借入コスト歪み排除)
+- クラッシュ特化リスク管理: シャンデリア・ATRトレーリングストップ + 高負荷スリッページ課金
 """
 
 from dataclasses import dataclass
@@ -68,13 +67,13 @@ ALL_REAL_START_DATE: str = "2011-06-15"
 # 2. UI & サイドバー設定
 # =============================================================
 st.set_page_config(
-    page_title="SDE-Engine Pro v2.3.2 | 10銘柄クオンツ検証システム",
+    page_title="SDE-Engine Pro v2.4.0 | 暴落迎撃TCO統合版",
     page_icon="⚡",
     layout="wide"
 )
 
-st.sidebar.title("⚡ SDE-Engine Pro v2.3.2")
-st.sidebar.caption("機関投資家水準・10銘柄マルチアセット動的配分モデル")
+st.sidebar.title("⚡ SDE-Engine Pro v2.4.0")
+st.sidebar.caption("機関投資家水準・デュアルレジーム動的配分モデル")
 
 st.sidebar.markdown("### 📅 データソース ＆ 期間")
 period_mode = st.sidebar.radio(
@@ -94,8 +93,8 @@ selected_period_label = st.sidebar.selectbox("取得期間", list(period_options
 period_code = period_options[selected_period_label]
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### ⚙️ ポートフォリオ ＆ リスク制御")
-max_cap_pct = st.sidebar.slider("1銘柄あたり絶対投資上限 (%)", 10, 100, 30, 5)
+st.sidebar.markdown("### ⚙️ コア巡航 (順張り) 設定")
+max_cap_pct = st.sidebar.slider("1銘柄あたり絶対投資上限 (%)", 10, 50, 30, 5)
 max_cap = float(max_cap_pct) / 100.0
 
 target_pf_vol_pct = st.sidebar.slider("目標ポートフォリオ年率Vol (%)", 20, 60, 40, 5)
@@ -103,11 +102,20 @@ target_pf_vol = float(target_pf_vol_pct) / 100.0
 
 vol_target_mode = st.sidebar.radio("Vol Targeting 方式", ["上限抑制のみ (Cap)", "双方向スケーリング (Targeting)"])
 
-fee_bps = st.sidebar.number_input("売買コスト＋スリッページ (片道 bps)", min_value=0, max_value=50, value=10, step=1)
+fee_bps = st.sidebar.number_input("通常売買コスト＋スリッページ (片道 bps)", min_value=0, max_value=50, value=10, step=1)
 fee_rate = float(fee_bps) / 10000.0
 
 use_dd_controller = st.sidebar.checkbox("DD連動型リスク抑制 (DD Controller)", value=True)
 base_currency = st.sidebar.radio("評価基準通貨", ["米ドル (USD)", "日本円 (JPY)"], horizontal=True)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🎯 暴落迎撃 (Tactical Crash Overlay)")
+enable_tco = st.sidebar.checkbox("TCO 暴落押し買いモードを有効化", value=True)
+tco_max_cap_pct = st.sidebar.slider("TCO 最大迎撃動員枠 (%)", 10, 40, 30, 5, disabled=not enable_tco)
+tco_max_cap = float(tco_max_cap_pct) / 100.0 if enable_tco else 0.0
+tco_top_k = st.sidebar.selectbox("迎撃銘柄上限 (スナイパー数)", [1, 2, 3], index=1, disabled=not enable_tco)
+tco_fee_bps = st.sidebar.number_input("TCOパニック時スリッページ (bps)", min_value=10, max_value=100, value=50, step=10, disabled=not enable_tco)
+tco_fee_rate = float(tco_fee_bps) / 10000.0
 
 # =============================================================
 # 3. データ取得 & 幾何整合スプライシングエンジン
@@ -192,7 +200,6 @@ def load_market_environment(period_str: str) -> Tuple[Dict[str, pd.DataFrame], p
         u_low = df_u["Low"].values
         n = len(base_idx)
 
-        # 1. 幾何整合合成データの生成
         syn_close = np.zeros(n)
         syn_open = np.zeros(n)
         syn_high = np.zeros(n)
@@ -213,7 +220,6 @@ def load_market_environment(period_str: str) -> Tuple[Dict[str, pd.DataFrame], p
             "Open": syn_open, "High": syn_high, "Low": syn_low, "Close": syn_close
         }, index=base_idx)
 
-        # 2. 実データとの連続接合（上場初日Openでの滑らかなスプライシング）
         has_real_etf = (sym in raw_data) and (not raw_data[sym].empty)
         real_idx = raw_data[sym].index.intersection(base_idx) if has_real_etf else pd.DatetimeIndex([])
 
@@ -231,6 +237,7 @@ def load_market_environment(period_str: str) -> Tuple[Dict[str, pd.DataFrame], p
 
         cleaned_data[sym] = syn_df.ffill().bfill()
 
+    cleaned_data["SPY"] = raw_data["SPY"].loc[base_idx].copy()
     return cleaned_data, fx_series, base_idx
 
 with st.spinner("市場データを取得・同期中..."):
@@ -252,7 +259,7 @@ latest_fx = float(fx_rates.loc[common_idx[-1]])
 n_days = len(common_idx)
 
 # =============================================================
-# 4. 特徴量 ＆ Purged Walk-Forward 確率校正
+# 4. 特徴量 ＆ TCOレジーム ＆ Purged Walk-Forward
 # =============================================================
 def calc_rsi(series: pd.Series, period: int = 9) -> np.ndarray:
     """Wilder法によるRSI算出（境界値防護付き）"""
@@ -266,7 +273,7 @@ def calc_rsi(series: pd.Series, period: int = 9) -> np.ndarray:
     return np.nan_to_num(100.0 - (100.0 / (1.0 + rs)), nan=50.0)
 
 def calc_parkinson_vol(df: pd.DataFrame, window: int = 10) -> np.ndarray:
-    """High/Lowスプレッドに基づくParkinsonボラティリティ（下限防護付き）"""
+    """High/Lowスプレッドに基づくParkinsonボラティリティ"""
     h = np.maximum(df["High"].values, EPSILON)
     l = np.maximum(df["Low"].values, EPSILON)
     factor = 1.0 / (4.0 * np.log(2.0))
@@ -274,12 +281,47 @@ def calc_parkinson_vol(df: pd.DataFrame, window: int = 10) -> np.ndarray:
     pv = np.sqrt(np.maximum(rolling_var, 0.0)) * np.sqrt(TRADING_DAYS_PER_YEAR) * 100.0
     return np.clip(np.nan_to_num(pv, nan=25.0), 5.0, 200.0)
 
+def calc_atr(df: pd.DataFrame, period: int = 10) -> np.ndarray:
+    """Average True Range (ATR) 算出（局所リスク評価用）"""
+    h = np.maximum(df["High"].values, EPSILON)
+    l = np.maximum(df["Low"].values, EPSILON)
+    c = np.maximum(df["Close"].values, EPSILON)
+    n = len(c)
+    tr = np.zeros(n)
+    tr[0] = h[0] - l[0]
+    for t in range(1, n):
+        tr[t] = max(h[t] - l[t], abs(h[t] - c[t - 1]), abs(l[t] - c[t - 1]))
+    atr = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean().values
+    return np.nan_to_num(atr, nan=1.0)
+
+def compute_market_crash_regime(
+    market_data: Dict[str, pd.DataFrame],
+    common_idx: pd.DatetimeIndex
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    市場全体のパニック・レジーム判定:
+    1. SPYの長短ボラティリティ比 (5日 ParkVol / 60日 ParkVol)
+    2. 安全資産 (UGL/GLD または TMF/TLT) への逃避フロー (Flight-to-Quality)
+    """
+    spy_df = market_data["SPY"].loc[common_idx]
+    pv_5 = calc_parkinson_vol(spy_df, window=5)
+    pv_60 = calc_parkinson_vol(spy_df, window=60)
+    vol_ratio = pv_5 / np.maximum(pv_60, EPSILON)
+
+    gld_df = market_data["GLD"].loc[common_idx] if "GLD" in market_data else spy_df
+    tlt_df = market_data["TLT"].loc[common_idx] if "TLT" in market_data else spy_df
+    safe_flow = (gld_df["Close"].pct_change(5).fillna(0.0).values > 0.0) | \
+                (tlt_df["Close"].pct_change(5).fillna(0.0).values > 0.0)
+
+    is_panic_regime = (vol_ratio >= 1.6) & safe_flow
+    return is_panic_regime, vol_ratio
+
 def compute_single_asset_signals(
     df_u: pd.DataFrame,
     df_etf: pd.DataFrame,
     cfg: AssetConfig
 ) -> Dict[str, Any]:
-    """1銘柄のシグナルおよびPurged Walk-Forward推論を生成（純粋関数）"""
+    """1銘柄の順張りシグナルおよびWalk-Forward推論を生成"""
     c_u = df_u["Close"].values
     o_etf = df_etf["Open"].values
     c_etf = df_etf["Close"].values
@@ -317,12 +359,10 @@ def compute_single_asset_signals(
 
     sigma_local = calc_parkinson_vol(df_etf, 10)
 
-    # 目的変数 (5日先リターン) & 特徴量空間
     fwd_ret_5d = pd.Series(c_u).pct_change(5).shift(-5).values
     y_target = np.where(fwd_ret_5d > 0, 1, 0)
     X_features = np.column_stack([trend_score, vol_score, overheat_penalty])
 
-    # Purged Walk-Forward確率校正
     p_bull = np.zeros(n)
     train_win = 252 * 3
     embargo = 5
@@ -358,9 +398,6 @@ def compute_single_asset_signals(
                 except Exception:
                     current_model = None
                     current_scaler = None
-            else:
-                current_model = None
-                current_scaler = None
 
         if current_model is not None and current_scaler is not None:
             try:
@@ -374,15 +411,14 @@ def compute_single_asset_signals(
             p_bull[t] = 1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))
 
     p_bull = np.where(~hysteresis, np.minimum(p_bull, 0.15), p_bull)
-
     vol_adj = np.clip(cfg.sigma_target / np.maximum(sigma_local, 1e-4), 0.2, 1.2)
     w_star = np.clip(p_bull * vol_adj, 0.0, 1.0) * (1.0 - overheat_penalty)
     w_star = np.where(~hysteresis, 0.0, w_star)
 
     if not hysteresis[-1]:
-        badge, desc = "🔴 弱気防衛 (待機)", "EMA50割れヒステリシス発動 / 全面防衛待機"
+        badge, desc = "🔴 弱気防衛 (待機)", "EMA50割れヒステリシス発動 / コア待機"
     elif overheat_penalty[-1] > 0.15:
-        badge, desc = "⚠️ 過熱警戒 (抑制)", f"RSI {rsi9[-1]:.1f} (動的閾値 {dyn_rsi_th[-1]:.1f}) 過熱ペナルティ作動"
+        badge, desc = "⚠️ 過熱警戒 (抑制)", f"RSI {rsi9[-1]:.1f} 過熱ペナルティ作動"
     elif p_bull[-1] < 0.55:
         badge, desc = "🟡 探査打診 (抑制配分)", f"打診フェーズ (P(Bull) {p_bull[-1]*100:.1f}%)"
     else:
@@ -409,8 +445,10 @@ for sym in asset_keys:
         cfg_sym
     )
 
+is_panic_series, vol_ratio_series = compute_market_crash_regime(market_data, common_idx)
+
 # =============================================================
-# 5. ポートフォリオ最適化 (有界ウォーターフォール ＆ 厳密資本制約)
+# 5. ポートフォリオ最適化 ＆ TCOハイブリッド配分
 # =============================================================
 o_etf_matrix = np.column_stack([signals[k]["o_etf"] for k in asset_keys])
 c_etf_matrix = np.column_stack([signals[k]["c_etf"] for k in asset_keys])
@@ -420,7 +458,6 @@ ret_open_to_open[1:] = (o_etf_matrix[1:] - o_etf_matrix[:-1]) / np.maximum(o_etf
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def calculate_rolling_covariances(rets: np.ndarray, window: int = 60, min_p: int = 20) -> np.ndarray:
-    """ローリング年率共分散テンソルの事前計算"""
     n, k = rets.shape
     df_r = pd.DataFrame(rets)
     cov_arr = df_r.rolling(window, min_periods=min_p).cov().values.reshape(n, k, k) * TRADING_DAYS_PER_YEAR
@@ -431,29 +468,38 @@ def calculate_rolling_covariances(rets: np.ndarray, window: int = 60, min_p: int
 
 roll_cov_matrix = calculate_rolling_covariances(ret_open_to_open)
 
-def generate_target_allocations(
+def generate_hybrid_allocations(
     raw_signals: Dict[str, Dict[str, Any]],
+    market_data: Dict[str, pd.DataFrame],
+    common_idx: pd.DatetimeIndex,
     user_max_cap: float,
     cov_tensor: np.ndarray,
     target_v: float,
-    is_bidirectional: bool
-) -> Tuple[np.ndarray, np.ndarray]:
-    """有界ウォーターフォール再配分と厳密資本制約（総和 <= 1.0）を満たす目標配分算出"""
+    is_bidirectional: bool,
+    enable_tco: bool,
+    tco_max_cap: float,
+    tco_top_k: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """コア巡航枠（最大 1.0 - tco_max_cap）と TCO迎撃枠の完全動的調和"""
     k = len(asset_keys)
-    n = n_days
+    n = len(common_idx)
+
+    core_limit = (1.0 - tco_max_cap) if enable_tco else 1.0
+    effective_core_cap = min(user_max_cap, core_limit)
+
     raw_w_mat = np.zeros((n, k))
     cond_caps_mat = np.zeros((n, k))
 
     for idx, sym in enumerate(asset_keys):
         p = raw_signals[sym]["p_bull"]
         w = raw_signals[sym]["w_star"]
-        cap = np.where(p < 0.40, 0.10, np.where(p < 0.55, 0.20, np.where(p < 0.70, 0.25, user_max_cap)))
-        cap = np.minimum(cap, user_max_cap)
+        cap = np.where(p < 0.40, 0.10, np.where(p < 0.55, 0.20, np.where(p < 0.70, 0.25, effective_core_cap)))
+        cap = np.minimum(cap, effective_core_cap)
         w_filtered = np.where((p < 0.35) | (w < 0.05), 0.0, w)
         raw_w_mat[:, idx] = np.minimum(w_filtered, cap)
         cond_caps_mat[:, idx] = cap
 
-    final_alloc = np.zeros_like(raw_w_mat)
+    core_alloc = np.zeros_like(raw_w_mat)
 
     for t in range(n):
         w = raw_w_mat[t].copy()
@@ -463,10 +509,9 @@ def generate_target_allocations(
             continue
 
         alloc = np.minimum(w, c_limits)
-        pool = 1.0 - float(np.sum(alloc))
+        pool = core_limit - float(np.sum(alloc))
         eligible = [i for i in active if alloc[i] < c_limits[i]]
 
-        # 有界ウォーターフォール再配分
         while eligible and pool > 1e-4:
             sub_w = w[eligible]
             s_sum = float(np.sum(sub_w))
@@ -487,7 +532,6 @@ def generate_target_allocations(
             if not hit:
                 break
 
-        # ポートフォリオVolターゲティング
         cov_t = cov_tensor[t]
         pf_var = float(np.dot(alloc.T, np.dot(cov_t, alloc)))
         pf_vol = np.sqrt(max(pf_var, 1e-6))
@@ -500,38 +544,92 @@ def generate_target_allocations(
                 if pf_vol > target_v:
                     alloc = alloc * (target_v / pf_vol)
 
-        # 厳密な資本制約保証 (現物運用: 合計投資枠 <= 100%)
         tot_alloc = float(np.sum(alloc))
-        if tot_alloc > 1.0:
-            alloc = alloc / tot_alloc
+        if tot_alloc > core_limit:
+            alloc = alloc * (core_limit / tot_alloc)
 
-        final_alloc[t] = alloc
+        core_alloc[t] = alloc
 
-    return final_alloc, cond_caps_mat
+    tco_alloc = np.zeros((n, k))
+    if not enable_tco:
+        return core_alloc, tco_alloc, core_alloc, cond_caps_mat
+
+    is_panic, _ = compute_market_crash_regime(market_data, common_idx)
+
+    z_scores = np.zeros((n, k))
+    atrs = np.zeros((n, k))
+    diff_50_mat = np.zeros((n, k))
+    rsi9_mat = np.zeros((n, k))
+
+    for idx, sym in enumerate(asset_keys):
+        cfg = ASSETS[sym]
+        df_u = market_data[cfg.underlying].loc[common_idx]
+        atrs[:, idx] = calc_atr(df_u, 10)
+        c_u = df_u["Close"].values
+        diff_50_mat[:, idx] = raw_signals[sym]["diff_50"]
+        rsi9_mat[:, idx] = raw_signals[sym]["rsi9"]
+        sigma_loc = raw_signals[sym]["sigma_local"]
+        z_scores[:, idx] = (c_u - pd.Series(c_u).ewm(span=50).mean().values) / np.maximum(sigma_loc, EPSILON)
+
+    for t in range(1, n):
+        market_crash = is_panic[t - 1]
+        avail_cash = max(0.0, 1.0 - float(np.sum(core_alloc[t - 1])))
+        tco_budget = min(tco_max_cap, avail_cash)
+
+        if tco_budget < 0.05:
+            continue
+
+        candidates = []
+        for i in range(k):
+            # 原資産が50日EMAから -6%以上下落 かつ RSI9 < 32
+            if diff_50_mat[t - 1, i] < -0.06 and rsi9_mat[t - 1, i] < 32.0:
+                candidates.append((i, z_scores[t - 1, i]))
+
+        if not candidates:
+            continue
+
+        # Z-Scoreが最も低い（過剰に売り叩かれた）上位銘柄をスナイプ
+        candidates.sort(key=lambda x: x[1])
+        selected = candidates[:tco_top_k]
+
+        slot_budget = tco_budget / len(selected)
+        for a_idx, _ in selected:
+            u_p = raw_signals[asset_keys[a_idx]]["c_u"][t - 1]
+            atr_v = atrs[t - 1, a_idx]
+            risk_unit = (3.0 * atr_v) / max(u_p, EPSILON)
+            dynamic_size = np.clip(0.01 / max(risk_unit, 0.02), 0.05, slot_budget)
+            tco_alloc[t, a_idx] = dynamic_size
+
+    comb_alloc = core_alloc + tco_alloc
+    for t in range(n):
+        s_comb = float(np.sum(comb_alloc[t]))
+        if s_comb > 1.0:
+            comb_alloc[t] /= s_comb
+
+    return core_alloc, tco_alloc, comb_alloc, cond_caps_mat
 
 is_bidir = (vol_target_mode == "双方向スケーリング (Targeting)")
-daily_target_alloc, active_caps = generate_target_allocations(
-    signals, max_cap, roll_cov_matrix, target_pf_vol, is_bidir
+core_target_alloc, tco_target_alloc, daily_target_alloc, active_caps = generate_hybrid_allocations(
+    signals, market_data, common_idx, max_cap, roll_cov_matrix, target_pf_vol,
+    is_bidir, enable_tco, tco_max_cap, tco_top_k
 )
 
 # =============================================================
-# 6. バックテスト ＆ ウェイト加重Trade PF集計
+# 6. バックテスト ＆ ATR動的決済 ＆ Trade PF集計
 # =============================================================
-def run_rigorous_backtest(
-    target_w: np.ndarray,
+def run_hybrid_backtest(
+    core_w: np.ndarray,
+    tco_w: np.ndarray,
     o_matrix: np.ndarray,
     fx: np.ndarray,
-    fee: float,
+    c_fee: float,
+    t_fee: float,
     use_dd: bool,
-    is_jpy: bool
+    is_jpy: bool,
+    market_data: Dict[str, pd.DataFrame],
+    common_idx: pd.DatetimeIndex
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-    """
-    【厳密タイムアライメント】
-    t-1日Close目標配分 target_w[t-1] を t日Openで約定。
-    t日Openからt+1日Openまでのリターンを獲得。
-    有効リターン長: n - 2 (インデックス 1 〜 n-2)
-    """
-    n, k = target_w.shape
+    n, k = core_w.shape
     valid_len = n - 2
     strat_net_ret = np.zeros(valid_len)
     effective_w = np.zeros((valid_len, k))
@@ -540,33 +638,44 @@ def run_rigorous_backtest(
 
     peak = 1.0
     cum = 1.0
+    last_w = np.zeros(k)
 
-    open_trades: Dict[int, Dict[str, Any]] = {}
+    open_trades: Dict[str, Dict[str, Any]] = {}
     completed_trades: List[Dict[str, Any]] = []
 
-    last_w = np.zeros(k)
+    u_high_mat = np.column_stack([market_data[ASSETS[sym].underlying].loc[common_idx]["High"].values for sym in asset_keys])
+    u_close_mat = np.column_stack([market_data[ASSETS[sym].underlying].loc[common_idx]["Close"].values for sym in asset_keys])
+    u_atr_mat = np.column_stack([calc_atr(market_data[ASSETS[sym].underlying].loc[common_idx], 10) for sym in asset_keys])
 
     for t in range(1, n - 1):
         idx_ret = t - 1
-        w_req = target_w[t - 1].copy()
+        cw_req = core_w[t - 1].copy()
+        tw_req = tco_w[t - 1].copy()
 
-        # ドローダウンコントローラー
         if use_dd:
             dd = (cum - peak) / peak
             if dd < -0.20:
-                w_req *= 0.40
+                cw_req *= 0.40
             elif dd < -0.10:
-                w_req *= 0.70
+                cw_req *= 0.70
+
+        w_req = cw_req + tw_req
+        tot_w = float(np.sum(w_req))
+        if tot_w > 1.0:
+            w_req /= tot_w
 
         effective_w[idx_ret] = w_req
         turnover = float(np.sum(np.abs(w_req - last_w)))
         effective_turnover[idx_ret] = turnover
-        cost = turnover * fee
+
+        # TCO取引とコア取引でスリッページを分別
+        tco_turnover = float(np.sum(np.abs(tw_req - (tco_w[t - 2] if t > 1 else 0.0))))
+        core_turnover = max(0.0, turnover - tco_turnover)
+        cost = (core_turnover * c_fee) + (tco_turnover * t_fee)
 
         r_asset_daily = (o_matrix[t + 1] - o_matrix[t]) / np.maximum(o_matrix[t], EPSILON)
         gross_ret = float(np.sum(w_req * r_asset_daily))
         cash_ret = float(max(0.0, 1.0 - np.sum(w_req))) * daily_cash_rate
-
         net_ret = gross_ret + cash_ret - cost
 
         if is_jpy:
@@ -578,63 +687,71 @@ def run_rigorous_backtest(
         if cum > peak:
             peak = cum
 
-        # ポートフォリオ資本貢献度に基づくトレード追跡
+        # トレード追跡管理
         for a_idx in range(k):
-            prev_p = last_w[a_idx]
-            curr_p = w_req[a_idx]
+            sym = asset_keys[a_idx]
+            key_tco = f"TCO_{a_idx}"
+            key_core = f"CORE_{a_idx}"
+            curr_tw = tw_req[a_idx]
+            curr_cw = cw_req[a_idx]
 
-            if prev_p <= 0.01 and curr_p > 0.01:
-                open_trades[a_idx] = {
-                    "entry_t": t,
-                    "entry_price": o_matrix[t, a_idx],
-                    "weight": curr_p
+            # 1. TCO 迎撃ポジション管理 (ATRトレーリング決済)
+            if curr_tw > 0.01 and key_tco not in open_trades:
+                open_trades[key_tco] = {
+                    "strategy": "TCO (暴落迎撃)", "asset": sym, "entry_t": t,
+                    "entry_price": o_matrix[t, a_idx], "weight": curr_tw,
+                    "highest_u": u_high_mat[t, a_idx], "entry_atr": u_atr_mat[t, a_idx]
                 }
-            elif prev_p > 0.01 and curr_p <= 0.01 and a_idx in open_trades:
-                tr = open_trades.pop(a_idx)
-                exit_price = o_matrix[t, a_idx]
-                pnl = (exit_price / max(tr["entry_price"], EPSILON) - 1.0) - (fee * 2.0)
-                weighted_pnl = pnl * tr["weight"]
+            elif key_tco in open_trades:
+                tr = open_trades[key_tco]
+                tr["highest_u"] = max(tr["highest_u"], u_high_mat[t, a_idx])
+                holding_d = t - tr["entry_t"]
+                stop_line = tr["highest_u"] - (2.5 * tr["entry_atr"])
+                should_exit = (u_close_mat[t, a_idx] < stop_line) or (holding_d >= 10) or (curr_tw <= 0.01)
+
+                if should_exit:
+                    exit_p = o_matrix[t, a_idx]
+                    pnl = (exit_p / max(tr["entry_price"], EPSILON) - 1.0) - (t_fee * 2.0)
+                    completed_trades.append({
+                        "strategy": "TCO (暴落迎撃)", "asset": sym,
+                        "entry_date": common_idx[int(tr["entry_t"])], "exit_date": common_idx[t],
+                        "holding_days": holding_d, "pnl_pct": pnl * 100.0,
+                        "weighted_pnl": pnl * tr["weight"], "weight": tr["weight"]
+                    })
+                    open_trades.pop(key_tco)
+
+            # 2. CORE 順張りポジション管理
+            prev_cw = last_w[a_idx] - (tco_w[t - 2, a_idx] if t > 1 else 0.0)
+            if prev_cw <= 0.01 and curr_cw > 0.01 and key_core not in open_trades:
+                open_trades[key_core] = {
+                    "strategy": "CORE (順張り)", "asset": sym, "entry_t": t,
+                    "entry_price": o_matrix[t, a_idx], "weight": curr_cw
+                }
+            elif prev_cw > 0.01 and curr_cw <= 0.01 and key_core in open_trades:
+                tr = open_trades.pop(key_core)
+                exit_p = o_matrix[t, a_idx]
+                pnl = (exit_p / max(tr["entry_price"], EPSILON) - 1.0) - (c_fee * 2.0)
                 completed_trades.append({
-                    "asset": asset_keys[a_idx],
-                    "entry_date": common_idx[int(tr["entry_t"])],
-                    "exit_date": common_idx[t],
-                    "holding_days": t - int(tr["entry_t"]),
-                    "pnl_pct": pnl * 100.0,
-                    "weighted_pnl": weighted_pnl,
-                    "weight": tr["weight"]
+                    "strategy": "CORE (順張り)", "asset": sym,
+                    "entry_date": common_idx[int(tr["entry_t"])], "exit_date": common_idx[t],
+                    "holding_days": t - int(tr["entry_t"]), "pnl_pct": pnl * 100.0,
+                    "weighted_pnl": pnl * tr["weight"], "weight": tr["weight"]
                 })
 
         last_w = w_req.copy()
-
-    # 最終未決済ポジションのマーク・トゥ・マーケット
-    final_t = n - 1
-    for a_idx, tr in list(open_trades.items()):
-        exit_price = o_matrix[final_t, a_idx]
-        pnl = (exit_price / max(tr["entry_price"], EPSILON) - 1.0) - fee
-        weighted_pnl = pnl * tr["weight"]
-        completed_trades.append({
-            "asset": asset_keys[a_idx],
-            "entry_date": common_idx[int(tr["entry_t"])],
-            "exit_date": common_idx[final_t],
-            "holding_days": final_t - int(tr["entry_t"]),
-            "pnl_pct": pnl * 100.0,
-            "weighted_pnl": weighted_pnl,
-            "weight": tr["weight"]
-        })
 
     return strat_net_ret, effective_w, effective_turnover, completed_trades
 
 use_jpy = (base_currency == "日本円 (JPY)")
 fx_array = fx_rates.loc[common_idx].values
 
-strat_ret, eff_w, eff_turnover, all_trades = run_rigorous_backtest(
-    daily_target_alloc, o_etf_matrix, fx_array, fee_rate, use_dd_controller, use_jpy
+strat_ret, eff_w, eff_turnover, all_trades = run_hybrid_backtest(
+    core_target_alloc, tco_target_alloc, o_etf_matrix, fx_array,
+    fee_rate, tco_fee_rate, use_dd_controller, use_jpy, market_data, common_idx
 )
 
-# バックテスト評価期間の一致 (t=1 〜 n-2)
 eval_idx = common_idx[1:-1]
 
-# ベンチマーク（10銘柄均等配分）の高速ベクトル化算出（NameErrorを完全根絶）
 bm_r = np.mean((o_etf_matrix[2:] - o_etf_matrix[1:-1]) / np.maximum(o_etf_matrix[1:-1], EPSILON), axis=1)
 if use_jpy:
     fx_r = (fx_array[2:] - fx_array[1:-1]) / np.maximum(fx_array[1:-1], EPSILON)
@@ -643,7 +760,6 @@ else:
     bm_eq_ret = bm_r
 
 def evaluate_performance(rets: np.ndarray, eff_weights: np.ndarray, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """クオンツリスク・リターン指標の網羅的算出"""
     if len(rets) == 0:
         return {k: 0.0 for k in ["CAGR", "MDD", "Vol", "Calmar", "Daily_PF", "Trade_PF", "Trade_WinRate", "CVaR_95", "Mean_Exposure", "Cap_Efficiency", "Avg_Hold_Days", "Total_Trades"]}
 
@@ -693,6 +809,8 @@ metrics_bm = evaluate_performance(bm_eq_ret, np.ones((len(bm_eq_ret), len(asset_
 cum_strat = np.cumprod(1.0 + strat_ret)
 cum_bm = np.cumprod(1.0 + bm_eq_ret)
 
+latest_core_alloc = core_target_alloc[-1]
+latest_tco_alloc = tco_target_alloc[-1]
 latest_alloc = daily_target_alloc[-1]
 tot_inv = float(np.sum(latest_alloc))
 tot_cash = max(0.0, 1.0 - tot_inv)
@@ -700,13 +818,13 @@ tot_cash = max(0.0, 1.0 - tot_inv)
 # =============================================================
 # 7. ダッシュボード・プレゼンテーション層
 # =============================================================
-st.title("⚡ SDE-Engine Pro v2.3.2 | 10銘柄マルチアセットシステム")
+st.title("⚡ SDE-Engine Pro v2.4.0 | 暴落迎撃TCO統合システム")
 st.caption(f"検証モード: **{period_mode}** ｜ 通貨: **{base_currency}** ｜ データ境界確定日: **{latest_date_str}** ({len(eval_idx)}営業日)")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🏛️ 最適配分 ＆ 発注シミュレータ",
     "🧪 バックテスト検証 ＆ 厳密統計評価",
-    "📜 トレード詳細履歴 (真のTrade PF)",
+    "📜 トレード詳細履歴 (CORE vs TCO)",
     "🔄 Purged Walk-Forward (OOS) 検証",
     "🎲 Block Bootstrap モンテカルロ",
     "💎 3目的 Pareto Frontier 探索"
@@ -718,26 +836,17 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 with tab1:
     st.info(f"📌 **判定基準日: {latest_date_str}（前日Close確定シグナル → 翌朝NYオープン執行）**")
 
-    with st.expander("ℹ️ 主要クオンツ指標の解説・見方（クリックで開閉）"):
-        exp_col1, exp_col2, exp_col3 = st.columns(3)
-        with exp_col1:
-            st.markdown(
-                "**📈 校正後 P(Bull)**\n\n"
-                "過去データのみで逐次学習・確率校正（Platt Scaling）された**「今後5日間に上昇する確率」**です。"
-                "未来データの混入を完全に排除し、実運用で偏りが出ないよう統計的に整合させています。"
-            )
-        with exp_col2:
-            st.markdown(
-                "**⚡ 9日動的RSI**\n\n"
-                "直近の短期買われすぎ水準を測定します。"
-                "固定値（70等）ではなく、過去1年の85%タイルを動的閾値とし、**閾値超過時に買付を自動抑制（過熱ブレーキ）**します。"
-            )
-        with exp_col3:
-            st.markdown(
-                "**🛡 確信度上限キャップ**\n\n"
-                "P(Bull)の確信度に応じて設定される**個別銘柄の最大配分枠（10%〜30%）**です。"
-                "余剰資金の再配分時、自信度が低い「打診銘柄」に過大な資金が流れ込むのを防ぎます。"
-            )
+    cur_panic = is_panic_series[-1]
+    cur_vol_r = vol_ratio_series[-1]
+
+    r_c1, r_c2 = st.columns([2, 1])
+    with r_c1:
+        if cur_panic:
+            st.error(f"🚨 **市場パニック・レジーム検知中 (長短Vol比: {cur_vol_r:.2f}倍)** ｜ TCO迎撃枠が発動可能です。")
+        else:
+            st.success(f"🕊️ **通常市場レジーム (長短Vol比: {cur_vol_r:.2f}倍)** ｜ コア順張り巡航モード稼働中")
+    with r_c2:
+        st.metric("TCO動員ステータス", "🎯 迎撃発動中" if np.sum(latest_tco_alloc) > 0 else "🛡️ 待機 (0.0%)")
 
     st.markdown("---")
 
@@ -748,7 +857,10 @@ with tab1:
         for col_idx, sym in enumerate(chunk_keys):
             idx_c = row_start + col_idx
             sig = signals[sym]
-            alloc_ratio = latest_alloc[idx_c]
+            c_alloc = latest_core_alloc[idx_c]
+            t_alloc = latest_tco_alloc[idx_c]
+            tot_a = latest_alloc[idx_c]
+
             with cols[col_idx]:
                 st.markdown(f"#### {sym}")
                 st.caption(f"{ASSETS[sym].name}")
@@ -758,30 +870,29 @@ with tab1:
                 st.progress(float(np.clip(sig["latest_p"], 0.0, 1.0)))
 
                 st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (動的閾値: {sig['latest_th']:.1f})")
+                st.caption(f"**乖離率:** 50日: `{sig['latest_diff50']*100:+.1f}%` ｜ 200日: `{sig['latest_diff200']*100:+.1f}%`")
 
-                st.caption(
-                    f"**乖離率:** 10日: `{sig['latest_diff10']*100:+.1f}%` ｜ "
-                    f"50日: `{sig['latest_diff50']*100:+.1f}%` ｜ "
-                    f"200日: `{sig['latest_diff200']*100:+.1f}%`"
-                )
+                st.info(f"**{sig['badge']}**")
 
-                st.caption(f"**確信度上限キャップ:** {active_caps[-1, idx_c]*100:.1f}%")
+                if t_alloc > 0:
+                    st.warning(f"🎯 **TCO迎撃配分: {t_alloc*100:.1f}%**")
 
-                st.info(f"**{sig['badge']}**\n\n*{sig['desc']}*")
-                if alloc_ratio > 0:
-                    st.success(f"**推奨配分:**\n\n### {alloc_ratio*100:.1f} %")
+                if tot_a > 0:
+                    st.success(f"**推奨総配分:**\n\n### {tot_a*100:.1f} %")
+                    st.caption(f"内訳: コア {c_alloc*100:.1f}% + 迎撃 {t_alloc*100:.1f}%")
                 else:
-                    st.warning("**配分:**\n\n### 0.0 % (待機)")
+                    st.write("**配分:**\n\n### 0.0 % (待機)")
         st.markdown("")
 
     st.markdown("---")
     c_s1, c_s2 = st.columns([1.5, 1])
     with c_s1:
-        st.markdown("### 💼 ポートフォリオ全体の実効アロケーション")
-        m_c1, m_c2, m_c3 = st.columns(3)
-        m_c1.metric("総株式エクスポージャー", f"{tot_inv*100:.1f} %")
-        m_c2.metric("米ドルMMF待機比率", f"{tot_cash*100:.1f} %")
-        m_c3.metric("目標PFボラティリティ", f"{target_pf_vol_pct} % ({vol_target_mode})")
+        st.markdown("### 💼 ポートフォリオ実効アロケーション")
+        m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+        m_c1.metric("コア順張り投資枠", f"{np.sum(latest_core_alloc)*100:.1f} %")
+        m_c2.metric("TCO暴落迎撃枠", f"{np.sum(latest_tco_alloc)*100:.1f} %")
+        m_c3.metric("米ドルMMF待機比率", f"{tot_cash*100:.1f} %")
+        m_c4.metric("総エクスポージャー", f"{tot_inv*100:.1f} %")
         st.caption("※総投資枠は厳密に100%以内に制限され、借入金利負担のない安全な現物運用を維持します。")
 
     with c_s2:
@@ -792,7 +903,7 @@ with tab1:
         st.plotly_chart(fig_pie, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("💡 証券会社 翌朝寄り付き発注シミュレーター")
+    st.subheader("💡 翌朝寄り付き発注シミュレーター")
     curr_c1, curr_c2, curr_c3 = st.columns([1.2, 1.5, 1.3])
     with curr_c1:
         in_curr = st.radio("入力通貨", ["日本円 (万円)", "米ドル (USD)"], horizontal=True)
@@ -814,20 +925,20 @@ with tab1:
         t_usd = total_usd * alloc_ratio
         t_jpy = t_usd * latest_fx
         shares = int(t_usd // p) if p > 0 else 0
-        action = f"目標 {shares} 株 買付" if alloc_ratio > 0 else "保有なし / 全売却待機"
+        tag = "🎯 迎撃" if latest_tco_alloc[idx_c] > 0 else ("🟢 巡航" if latest_core_alloc[idx_c] > 0 else "待機")
         sim_rows.append({
             "銘柄": ASSETS[sym].name,
-            "シグナル判定": signals[sym]["badge"],
-            "最適配分": f"{alloc_ratio*100:.1f} %",
+            "種別": tag,
+            "最適総配分": f"{alloc_ratio*100:.1f} %",
             "投資目標額 (USD)": f"${t_usd:,.2f}",
             "概算金額 (JPY)": f"約 {t_jpy:,.0f} 円" if alloc_ratio > 0 else "0 円",
             "参考株価": f"${p:.2f}",
             "執行株数": f"{shares} 株",
-            "アクション": action
+            "アクション": f"目標 {shares} 株 買付" if alloc_ratio > 0 else "保有なし / 全売却待機"
         })
     c_usd = total_usd * tot_cash
     sim_rows.append({
-        "銘柄": "米ドルMMF / 現金待機", "シグナル判定": "🛡 安全待機", "最適配分": f"{tot_cash*100:.1f} %",
+        "銘柄": "米ドルMMF / 現金待機", "種別": "🛡 保守", "最適総配分": f"{tot_cash*100:.1f} %",
         "投資目標額 (USD)": f"${c_usd:,.2f}", "概算金額 (JPY)": f"約 {c_usd*latest_fx:,.0f} 円",
         "参考株価": "-", "執行株数": "-", "アクション": "MMF待機 (年利約3.5%)"
     })
@@ -848,7 +959,7 @@ with tab2:
 
     st.markdown("---")
     fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.3.2 (翌朝Open約定・ネット費用後)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v2.4.0 (TCO迎撃統合版)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
     fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (10銘柄均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
 
     peak_s = np.maximum.accumulate(cum_strat)
@@ -865,24 +976,43 @@ with tab2:
 
     st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
     perf_data = [
-        {"戦略": "SDE-Engine Pro v2.3.2", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
+        {"戦略": "SDE-Engine Pro v2.4.0 (TCO統合)", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF (加重)": f"{metrics_strat['Trade_PF']:.2f}", "Daily PF": f"{metrics_strat['Daily_PF']:.2f}", "トレード勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "実効平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_strat['CVaR_95']*100:.2f}%"},
         {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Calmar": f"{metrics_bm['Calmar']:.2f}", "Trade PF (加重)": "-", "Daily PF": f"{metrics_bm['Daily_PF']:.2f}", "トレード勝率": "-", "実効平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}", "日次95% CVaR": f"{metrics_bm['CVaR_95']*100:.2f}%"}
     ]
     st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
-# TAB 3: トレード詳細履歴 (真のTrade PF)
+# TAB 3: トレード詳細履歴 (CORE vs TCO)
 # -------------------------------------------------------------
 with tab3:
-    st.subheader("📜 1トレード単位 (Entry〜Exit) の純損益集計")
-    st.caption("各トレードのエクスポージャー（配分比率）を乗じた『ポートフォリオ資本貢献損益』に基づき厳密集計しています。")
-    t_c1, t_c2, t_c3 = st.columns(3)
-    t_c1.metric("総完結トレード数", f"{metrics_strat['Total_Trades']} 件")
-    t_c2.metric("真の加重 Trade PF", f"{metrics_strat['Trade_PF']:.2f}")
-    t_c3.metric("平均保有日数", f"{metrics_strat['Avg_Hold_Days']:.1f} 営業日")
+    st.subheader("📜 戦略別 (CORE順張り vs TCO暴落迎撃) 実績クロス集計")
+    st.caption("TCOトレードにはパニック時特別スリッページ（50bps）およびシャンデリア・ATRトレーリングストップが適用されています。")
 
     if len(all_trades) > 0:
         df_trades = pd.DataFrame(all_trades)
+        t_col1, t_col2 = st.columns(2)
+
+        for st_name, col_obj in [("CORE (順張り)", t_col1), ("TCO (暴落迎撃)", t_col2)]:
+            sub = df_trades[df_trades["strategy"] == st_name]
+            with col_obj:
+                st.markdown(f"#### 🏛️ {st_name}")
+                if len(sub) > 0:
+                    win_sub = sub[sub["weighted_pnl"] > 0]
+                    loss_sub = sub[sub["weighted_pnl"] < 0]
+                    w_rate = len(win_sub) / len(sub) * 100.0
+                    sum_w = sub[sub["weighted_pnl"] > 0]["weighted_pnl"].sum()
+                    sum_l = abs(sub[sub["weighted_pnl"] < 0]["weighted_pnl"].sum())
+                    s_pf = (sum_w / sum_l) if sum_l > EPSILON else (99.0 if sum_w > 0 else 0.0)
+                    avg_h = sub["holding_days"].mean()
+
+                    sm1, sm2, sm3 = st.columns(3)
+                    sm1.metric("トレード数", f"{len(sub)} 件")
+                    sm2.metric("勝率 / PF", f"{w_rate:.1f}% / {s_pf:.2f}")
+                    sm3.metric("平均保有日数", f"{avg_h:.1f} 日")
+                else:
+                    st.info(f"{st_name} の完結トレードはありません。")
+
+        st.markdown("---")
         df_trades["entry_date"] = pd.to_datetime(df_trades["entry_date"]).dt.strftime('%Y-%m-%d')
         df_trades["exit_date"] = pd.to_datetime(df_trades["exit_date"]).dt.strftime('%Y-%m-%d')
         df_trades["pnl_pct_str"] = df_trades["pnl_pct"].apply(lambda x: f"{x:+.2f} %")
@@ -890,9 +1020,9 @@ with tab3:
         df_trades["weight_str"] = df_trades["weight"].apply(lambda x: f"{x*100:.1f} %")
 
         st.dataframe(
-            df_trades[["asset", "entry_date", "exit_date", "weight_str", "holding_days", "pnl_pct_str", "weighted_pnl_str"]].rename(columns={
-                "asset": "銘柄", "entry_date": "買付日", "exit_date": "売却日",
-                "weight_str": "エントリー配分", "holding_days": "保有日数",
+            df_trades[["strategy", "asset", "entry_date", "exit_date", "weight_str", "holding_days", "pnl_pct_str", "weighted_pnl_str"]].rename(columns={
+                "strategy": "戦略種別", "asset": "銘柄", "entry_date": "買付日", "exit_date": "売却日",
+                "weight_str": "投入配分", "holding_days": "保有日数",
                 "pnl_pct_str": "単体純損益 (%)", "weighted_pnl_str": "PF貢献損益 (%)"
             }),
             use_container_width=True, height=400, hide_index=True
@@ -953,7 +1083,7 @@ with tab4:
 # -------------------------------------------------------------
 with tab5:
     st.subheader("🎲 Circular Block Bootstrap (ボラティリティ連鎖保持)")
-    st.caption("10営業日のブロック単位でリサンプリングし、ボラティリティ・クラスタリングを再現したファンチャートです。")
+    st.caption("10営業日のブロック単位でリサンプリングし、テールリスクを再現したファンチャートです。")
 
     block_size = 10
     n_sims = 500
@@ -991,7 +1121,11 @@ with tab5:
         st.markdown("#### ⚡ 取引摩擦ストレステスト")
         stress_list = []
         for test_bps in [0, 10, 20, 30, 50]:
-            r_st, _, _, _ = run_rigorous_backtest(daily_target_alloc, o_etf_matrix, fx_array, test_bps/10000.0, use_dd_controller, use_jpy)
+            r_st, _, _, _ = run_hybrid_backtest(
+                core_target_alloc, tco_target_alloc, o_etf_matrix, fx_array,
+                test_bps/10000.0, max(test_bps*2, 30)/10000.0, use_dd_controller, use_jpy,
+                market_data, common_idx
+            )
             c_st = (np.cumprod(1.0 + r_st)[-1] ** (1.0 / max(len(r_st)/252, 0.1))) - 1.0
             stress_list.append({
                 "片道コスト": f"{test_bps} bps", "CAGR": f"{c_st*100:.1f}%", "劣化幅": f"{(c_st - metrics_strat['CAGR'])*100:+.1f}%"
@@ -999,41 +1133,37 @@ with tab5:
         st.dataframe(pd.DataFrame(stress_list), use_container_width=True, hide_index=True)
 
 # -------------------------------------------------------------
-# TAB 6: 3目的 Pareto Frontier 探索 (SessionState永続化版)
+# TAB 6: 3目的 Pareto Frontier 探索
 # -------------------------------------------------------------
 with tab6:
     st.subheader("💎 3目的 Pareto Frontier (収益 vs MDD vs CVaR) 探索")
 
-    with st.expander("💡 この図の見方・選び方", expanded=True):
-        st.markdown("""
-        * **縦軸（上ほど良い）**: 年平均リターン（CAGR）
-        * **横軸（左ほど良い）**: 最大下落率（MDDが小さく資産防衛力が高い）
-        * **丸の大きさ（大きいほど良い）**: Calmar比率（下落に対する収益効率）
-        * **丸の色（濃いほど安全）**: 日次95% CVaRが小さくテールリスクが抑制されている
-        """)
-
     if "pareto_df" not in st.session_state:
         st.session_state.pareto_df = None
 
-    if st.button("🚀 パレート探索を実行 (主要パラメータグリッドスキャン)"):
+    if st.button("🚀 パレート探索を実行 (TCOハイブリッド グリッドスキャン)"):
         with st.spinner("パラメータ空間を高速走査中..."):
             grid_results = []
             for scan_vol in [0.30, 0.40, 0.50]:
-                for scan_cap in [0.20, 0.30, 0.40]:
-                    scan_alloc, _ = generate_target_allocations(signals, scan_cap, roll_cov_matrix, scan_vol, False)
-                    for scan_dd in [True, False]:
-                        r_sc, eff_w_sc, _, tr_sc = run_rigorous_backtest(scan_alloc, o_etf_matrix, fx_array, fee_rate, scan_dd, use_jpy)
-                        m_sc = evaluate_performance(r_sc, eff_w_sc, tr_sc)
-                        grid_results.append({
-                            "TargetVol": f"{int(scan_vol*100)}%",
-                            "MaxCap": f"{int(scan_cap*100)}%",
-                            "DD_Ctrl": "ON" if scan_dd else "OFF",
-                            "設定ラベル": f"Vol {int(scan_vol*100)}% / 上限 {int(scan_cap*100)}% / DD:{'ON' if scan_dd else 'OFF'}",
-                            "CAGR": m_sc["CAGR"] * 100.0,
-                            "MDD": abs(m_sc["MDD"] * 100.0),
-                            "CVaR_95": abs(m_sc["CVaR_95"] * 100.0),
-                            "Calmar": m_sc["Calmar"]
-                        })
+                for scan_tco in [0.0, 0.20, 0.30]:
+                    s_core, s_tco, s_comb, _ = generate_hybrid_allocations(
+                        signals, market_data, common_idx, max_cap, roll_cov_matrix, scan_vol,
+                        False, (scan_tco > 0), scan_tco, tco_top_k
+                    )
+                    r_sc, eff_w_sc, _, tr_sc = run_hybrid_backtest(
+                        s_core, s_tco, o_etf_matrix, fx_array, fee_rate, tco_fee_rate,
+                        use_dd_controller, use_jpy, market_data, common_idx
+                    )
+                    m_sc = evaluate_performance(r_sc, eff_w_sc, tr_sc)
+                    grid_results.append({
+                        "TargetVol": f"{int(scan_vol*100)}%",
+                        "TCO_Cap": f"{int(scan_tco*100)}%",
+                        "設定ラベル": f"Vol {int(scan_vol*100)}% / 迎撃枠 {int(scan_tco*100)}%",
+                        "CAGR": m_sc["CAGR"] * 100.0,
+                        "MDD": abs(m_sc["MDD"] * 100.0),
+                        "CVaR_95": abs(m_sc["CVaR_95"] * 100.0),
+                        "Calmar": m_sc["Calmar"]
+                    })
 
             st.session_state.pareto_df = pd.DataFrame(grid_results)
 
@@ -1059,14 +1189,14 @@ with tab6:
                 f"**② 最も安全重視 (下落最小)**\n\n"
                 f"**【{best_safe['設定ラベル']}】**\n\n"
                 f"* CAGR: **{best_safe['CAGR']:.1f}%**\n"
-                f"* MDD: **-{best_safe['MDD']:.1f}%** (最小リスク)\n"
+                f"* MDD: **-{best_safe['MDD']:.1f}%**\n"
                 f"* Calmar比率: **{best_safe['Calmar']:.2f}**"
             )
         with col_b3:
             st.warning(
                 f"**③ 最も収益重視 (リターン最大)**\n\n"
                 f"**【{best_growth['設定ラベル']}】**\n\n"
-                f"* CAGR: **{best_growth['CAGR']:.1f}%** (最高益)\n"
+                f"* CAGR: **{best_growth['CAGR']:.1f}%**\n"
                 f"* MDD: **-{best_growth['MDD']:.1f}%**\n"
                 f"* Calmar比率: **{best_growth['Calmar']:.2f}**"
             )
@@ -1095,22 +1225,6 @@ with tab6:
             )
         ))
 
-        fig_pareto.add_annotation(
-            x=best_balanced["MDD"], y=best_balanced["CAGR"],
-            text="🏆 総合最優秀", showarrow=True, arrowhead=2,
-            arrowsize=1, arrowwidth=2, arrowcolor="#2ecc71", ax=35, ay=-35
-        )
-        fig_pareto.add_annotation(
-            x=best_safe["MDD"], y=best_safe["CAGR"],
-            text="🛡 最安全", showarrow=True, arrowhead=2,
-            arrowsize=1, arrowwidth=2, arrowcolor="#3498db", ax=-35, ay=-35
-        )
-        fig_pareto.add_annotation(
-            x=best_growth["MDD"], y=best_growth["CAGR"],
-            text="🚀 最高益", showarrow=True, arrowhead=2,
-            arrowsize=1, arrowwidth=2, arrowcolor="#e67e22", ax=35, ay=35
-        )
-
         fig_pareto.update_layout(
             title="Pareto 最適空間 (左上ほど優秀 ｜ 丸サイズ: Calmar比率)",
             xaxis_title="最大ドローダウン MDD (%) [← 左ほど下落が小さく安全]",
@@ -1119,8 +1233,3 @@ with tab6:
             hovermode="closest"
         )
         st.plotly_chart(fig_pareto, use_container_width=True)
-
-        st.markdown("### 📋 全パラメータ走査結果（Calmar比率 順）")
-        st.dataframe(df_grid.sort_values(by="Calmar", ascending=False), use_container_width=True, hide_index=True)
-    else:
-        st.info("上のボタンを押すと、全18通りのパラメータ走査とPareto最適解の散布図が生成されます。")
