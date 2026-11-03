@@ -1076,3 +1076,515 @@ with tab1:
         with p_col3:
             st.markdown(
                 "**3. ステートフル保持 ＆ 4重イグジット**\n\n"
+                "・**1日強制決済バグ解消**: RSIが33を超えても利確目標まで継続保有\n"
+                "・**利確**: 9日RSI ≥ 54 または 10日/20日EMA回復で翌Open決済\n"
+                "・**利益保護**: +1.2 ATR到達で建値ロック＋タイトトレーリング移行\n"
+                f"・**防衛**: 最高値 -2.2 ATR割れ または {tco_max_hold}営業日経過で撤退"
+            )
+
+    cur_panic = is_panic_series[-1]
+    cur_vol_r = vol_ratio_series[-1]
+    cur_temp = panic_temp_series[-1]
+
+    r_c1, r_c2, r_c3 = st.columns([2, 1, 1])
+    with r_c1:
+        if cur_panic:
+            st.error(f"🚨 **市場クラッシュ警戒レジーム検知中 (長短Vol比: {cur_vol_r:.2f}倍)** ｜ TCOスナイパー監視稼働中")
+        else:
+            st.success(f"🕊️ **通常市場レジーム (長短Vol比: {cur_vol_r:.2f}倍)** ｜ マルチファクターCORE巡航稼働中")
+    with r_c2:
+        st.metric("TCO動員ステータス", f"🎯 迎撃中 ({np.sum(latest_tco_alloc)*100:.1f}%)" if np.sum(latest_tco_alloc) > 0 else "🛡️ 待機 (0.0%)")
+    with r_c3:
+        st.metric("パニック温度ロット係数", f"{cur_temp*100:.0f} %", "激動時自動縮小")
+
+    st.markdown("---")
+
+    chunk_size = 5
+    for row_start in range(0, len(asset_keys), chunk_size):
+        chunk_keys = asset_keys[row_start:row_start + chunk_size]
+        cols = st.columns(len(chunk_keys))
+        for col_idx, sym in enumerate(chunk_keys):
+            idx_c = row_start + col_idx
+            sig = signals[sym]
+            c_alloc = latest_core_alloc[idx_c]
+            t_alloc = latest_tco_alloc[idx_c]
+            tot_a = latest_alloc[idx_c]
+
+            with cols[col_idx]:
+                st.markdown(f"#### {sym}")
+                st.caption(f"{ASSETS[sym].name}")
+                st.metric(f"原資産 {ASSETS[sym].underlying}", f"${sig['u_close']:.2f}")
+
+                st.write(f"校正後 P(Bull): **{sig['latest_p']*100:.1f}%**")
+                st.progress(float(np.clip(sig["latest_p"], 0.0, 1.0)))
+
+                st.caption(f"**9日RSI:** {sig['latest_rsi']:.1f} (動的閾値: {sig['latest_th']:.1f})")
+                st.caption(f"**乖離:** 50日 `{sig['latest_diff50']*100:+.1f}%` ({sig['latest_z50']:+.1f}σ) ｜ 200日 `{sig['latest_diff200']*100:+.1f}%`")
+
+                st.info(f"**{sig['badge']}**")
+
+                st.markdown("**🎯 TCO迎撃ステータス:**")
+                if sig["tco_status_type"] == "ready":
+                    st.success(f"**{sig['tco_badge']}**\n\n*{sig['tco_desc']}*")
+                elif sig["tco_status_type"] in ["waiting_turn", "waiting_rsi"]:
+                    st.warning(f"**{sig['tco_badge']}**\n\n*{sig['tco_desc']}*")
+                else:
+                    st.caption(f"**{sig['tco_badge']}** ｜ *{sig['tco_desc']}*")
+
+                st.caption(f"・ETF想定ストップ幅: 約 -{sig['risk_pct_etf']:.1f}% (原資産 -{sig['risk_pct_u']:.1f}%)")
+                st.caption(f"・利確目標 (10日/20日EMA): `{sig['latest_diff10']*100:+.1f}%` / `{sig['latest_diff20']*100:+.1f}%`")
+
+                if t_alloc > 0:
+                    st.warning(f"🎯 **TCO迎撃配分: {t_alloc*100:.1f}%**")
+
+                if tot_a > 0:
+                    st.success(f"**推奨総配分:**\n\n### {tot_a*100:.1f} %")
+                    st.caption(f"内訳: コア {c_alloc*100:.1f}% + 迎撃 {t_alloc*100:.1f}%")
+                else:
+                    st.write("**配分:**\n\n### 0.0 % (待機)")
+        st.markdown("")
+
+    st.markdown("---")
+    # 2次元クオンツ・レーダー & 相関ヒートマップ
+    rad_c1, rad_c2 = st.columns([1.3, 1])
+    with rad_c1:
+        st.markdown("#### 📡 2次元クオンツ・レーダー (順張り確率 vs 暴落迎撃Zスコア)")
+        r_x = [signals[s]["latest_p"] * 100.0 for s in asset_keys]
+        r_y = [-signals[s]["latest_z50"] for s in asset_keys]  # 上に行くほど売られすぎ
+        r_size = [max(14.0, latest_alloc[i] * 160.0) for i in range(len(asset_keys))]
+        r_colors = [ASSETS[s].color for s in asset_keys]
+
+        fig_rad = go.Figure()
+        fig_rad.add_trace(go.Scatter(
+            x=r_x, y=r_y, mode="markers+text", text=asset_keys,
+            textposition="top center",
+            marker=dict(size=r_size, color=r_colors, opacity=0.85, line=dict(width=1.5, color="white")),
+            hovertemplate="<b>%{text}</b><br>P(Bull): %{x:.1f}%<br>売られすぎ深度 (-Z): %{y:.2f}σ<extra></extra>"
+        ))
+        fig_rad.add_hline(y=1.8, line_dash="dash", line_color="#e74c3c", annotation_text="TCO迎撃警戒圏 (+1.8σ売られすぎ)")
+        fig_rad.add_vline(x=55.0, line_dash="dash", line_color="#00ba38", annotation_text="CORE巡航基準 (55%)")
+        fig_rad.update_layout(
+            xaxis_title="順張り強気確率 P(Bull) [%] → 右ほどCORE優勢",
+            yaxis_title="売られすぎ深度 (-Z50) [σ] → 上ほどTCO迎撃候補",
+            height=340, margin=dict(t=20, b=20, l=10, r=10)
+        )
+        st.plotly_chart(fig_rad, use_container_width=True)
+
+    with rad_c2:
+        st.markdown("#### 🔗 直近60営業日 ローリング相関マトリクス")
+        cov_now = roll_cov_matrix[-1]
+        std_now = np.sqrt(np.maximum(np.diag(cov_now), 1e-6))
+        corr_now = np.round(cov_now / np.outer(std_now, std_now), 2)
+        fig_corr = go.Figure(data=go.Heatmap(
+            z=corr_now, x=asset_keys, y=asset_keys,
+            colorscale="RdBu_r", zmin=-1.0, zmax=1.0,
+            text=corr_now, texttemplate="%{text:.2f}", textfont={"size": 10}
+        ))
+        fig_corr.update_layout(height=340, margin=dict(t=20, b=20, l=10, r=10))
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+    st.markdown("---")
+    c_s1, c_s2 = st.columns([1.5, 1])
+    with c_s1:
+        st.markdown("### 💼 ポートフォリオ実効アロケーション")
+        m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+        m_c1.metric("コア順張り投資枠", f"{np.sum(latest_core_alloc)*100:.1f} %")
+        m_c2.metric("TCO暴落迎撃枠", f"{np.sum(latest_tco_alloc)*100:.1f} %")
+        m_c3.metric("米ドルMMF待機比率", f"{tot_cash*100:.1f} %")
+        m_c4.metric("総エクスポージャー", f"{tot_inv*100:.1f} %")
+        st.caption("※動的キャピタル・スイープにより総投資枠は厳密に100%以内に制御されます。")
+
+    with c_s2:
+        active_labels = [asset_keys[i] for i in range(len(asset_keys)) if latest_alloc[i] > 0] + ["米ドルMMF"]
+        active_vals = [latest_alloc[i] * 100 for i in range(len(asset_keys)) if latest_alloc[i] > 0] + [tot_cash * 100]
+        fig_pie = go.Figure(data=[go.Pie(labels=active_labels, values=active_vals, hole=.45)])
+        fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=200)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("💡 翌朝寄り付き発注シミュレーター")
+    curr_c1, curr_c2, curr_c3 = st.columns([1.2, 1.5, 1.3])
+    with curr_c1:
+        in_curr = st.radio("入力通貨", ["日本円 (万円)", "米ドル (USD)"], horizontal=True)
+    with curr_c2:
+        if in_curr == "日本円 (万円)":
+            f_jpy_man = st.number_input("運用資産総額（万円）", min_value=10, value=300, step=10)
+            total_usd = (f_jpy_man * 10000.0) / latest_fx
+        else:
+            total_usd = float(st.number_input("運用資産総額 (USD)", min_value=1000, value=20000, step=1000))
+    with curr_c3:
+        st.metric("最新為替レート (USD/JPY)", f"¥{latest_fx:.2f}")
+
+    sim_rows = []
+    for idx_c, sym in enumerate(asset_keys):
+        alloc_ratio = latest_alloc[idx_c]
+        p = signals[sym]["etf_price"]
+        t_usd = total_usd * alloc_ratio
+        t_jpy = t_usd * latest_fx
+        shares = int(t_usd // p) if p > 0 else 0
+        tag = "🎯 迎撃" if latest_tco_alloc[idx_c] > 0 else ("🟢 巡航" if latest_core_alloc[idx_c] > 0 else "待機")
+        sim_rows.append({
+            "銘柄": ASSETS[sym].name,
+            "種別": tag,
+            "最適総配分": f"{alloc_ratio*100:.1f} %",
+            "投資目標額 (USD)": f"${t_usd:,.2f}",
+            "概算金額 (JPY)": f"約 {t_jpy:,.0f} 円" if alloc_ratio > 0 else "0 円",
+            "参考株価": f"${p:.2f}",
+            "執行株数": f"{shares} 株",
+            "アクション": f"目標 {shares} 株 買付" if alloc_ratio > 0 else "保有なし / 全売却待機"
+        })
+    c_usd = total_usd * tot_cash
+    sim_rows.append({
+        "銘柄": "米ドルMMF / 現金待機", "種別": "🛡 保守", "最適総配分": f"{tot_cash*100:.1f} %",
+        "投資目標額 (USD)": f"${c_usd:,.2f}", "概算金額 (JPY)": f"約 {c_usd*latest_fx:,.0f} 円",
+        "参考株価": "-", "執行株数": "-", "アクション": "MMF待機 (年利約3.5%)"
+    })
+    st.dataframe(pd.DataFrame(sim_rows), use_container_width=True, hide_index=True)
+
+# -------------------------------------------------------------
+# TAB 2: バックテスト検証 ＆ 寄与度分解
+# -------------------------------------------------------------
+with tab2:
+    st.subheader("🧪 厳密クオンツ・バックテスト検証 (ネット費用後)")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("CAGR", f"{metrics_strat['CAGR']*100:.1f}%", f"BM均等: {metrics_bm['CAGR']*100:.1f}%")
+    c2.metric("最大下落率 (MDD)", f"{metrics_strat['MDD']*100:.1f}%", f"BM均等: {metrics_bm['MDD']*100:.1f}%")
+    c3.metric("Sharpe / Sortino", f"{metrics_strat['Sharpe']:.2f} / {metrics_strat['Sortino']:.2f}", f"Calmar: {metrics_strat['Calmar']:.2f}")
+    c4.metric("Trade PF (加重)", f"{metrics_strat['Trade_PF']:.2f}", f"勝率: {metrics_strat['Trade_WinRate']*100:.1f}%")
+    c5.metric("実効資本効率 (CAGR/Exp)", f"{metrics_strat['Cap_Efficiency']:.2f}", f"平均Exp: {metrics_strat['Mean_Exposure']*100:.1f}%")
+    c6.metric("95% CVaR (日次)", f"{metrics_strat['CVaR_95']*100:.2f}%", f"全 {metrics_strat['Total_Trades']} 件")
+
+    st.markdown("---")
+    fig_bt = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.50, 0.25, 0.25])
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_strat, name="SDE Pro v3.0.0 (統合進化版)", line=dict(color="#00ba38", width=2.5)), row=1, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_bm, name="BM: Daily Equal Weight (10銘柄均等)", line=dict(color="#888888", width=1.5, dash="dot")), row=1, col=1)
+
+    # 戦略別寄与度分解 (Attribution)
+    cum_core_attr = np.cumprod(1.0 + attrib_rets["core"])
+    cum_tco_attr = np.cumprod(1.0 + attrib_rets["tco"])
+    cum_cash_attr = np.cumprod(1.0 + attrib_rets["cash"])
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_tco_attr, name="TCO (暴落迎撃) 単体寄与倍率", line=dict(color="#f39c12", width=2)), row=2, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=cum_cash_attr, name="MMF金利 単体寄与倍率", line=dict(color="#3498db", width=1.5, dash="dot")), row=2, col=1)
+
+    peak_s = np.maximum.accumulate(cum_strat)
+    dd_s = (cum_strat - peak_s) / np.maximum(peak_s, EPSILON)
+    peak_b = np.maximum.accumulate(cum_bm)
+    dd_b = (cum_bm - peak_b) / np.maximum(peak_b, EPSILON)
+
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=dd_s * 100, name="戦略DD (%)", fill="tozeroy", line=dict(color="#d62728", width=1)), row=3, col=1)
+    fig_bt.add_trace(go.Scatter(x=eval_idx, y=dd_b * 100, name="BM均等DD (%)", line=dict(color="#7f7f7f", width=1, dash="dash")), row=3, col=1)
+
+    fig_bt.update_layout(height=680, margin=dict(t=20, b=20, l=10, r=10), hovermode="x unified")
+    fig_bt.update_yaxes(title_text="累積資産成長 (対数)", type="log", row=1, col=1)
+    fig_bt.update_yaxes(title_text="TCO/MMF寄与", row=2, col=1)
+    fig_bt.update_yaxes(title_text="DD (%)", row=3, col=1)
+    st.plotly_chart(fig_bt, use_container_width=True)
+
+    st.markdown("### 📋 リスク・リターン ＆ 資本効率 詳細対比")
+    perf_data = [
+        {"戦略": "SDE-Engine Pro v3.0.0 (統合進化版)", "CAGR": f"{metrics_strat['CAGR']*100:.1f}%", "MDD": f"{metrics_strat['MDD']*100:.1f}%", "Sharpe": f"{metrics_strat['Sharpe']:.2f}", "Sortino": f"{metrics_strat['Sortino']:.2f}", "Calmar": f"{metrics_strat['Calmar']:.2f}", "Trade PF": f"{metrics_strat['Trade_PF']:.2f}", "勝率": f"{metrics_strat['Trade_WinRate']*100:.1f}%", "平均Exp": f"{metrics_strat['Mean_Exposure']*100:.1f}%", "資本効率": f"{metrics_strat['Cap_Efficiency']:.2f}"},
+        {"戦略": "BM: Equal Weight (10銘柄)", "CAGR": f"{metrics_bm['CAGR']*100:.1f}%", "MDD": f"{metrics_bm['MDD']*100:.1f}%", "Sharpe": f"{metrics_bm['Sharpe']:.2f}", "Sortino": f"{metrics_bm['Sortino']:.2f}", "Calmar": f"{metrics_bm['Calmar']:.2f}", "Trade PF": "-", "勝率": "-", "平均Exp": "100.0%", "資本効率": f"{metrics_bm['Cap_Efficiency']:.2f}"}
+    ]
+    st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
+
+# -------------------------------------------------------------
+# TAB 3: トレード詳細診断 (CORE vs TCO)
+# -------------------------------------------------------------
+with tab3:
+    st.subheader("📜 戦略別・決済理由別・銘柄別 実績クロス診断")
+    st.caption("COREのopen_trades.pop欠落バグおよびTCOの1日強制決済バグを解消した厳密なトレード統計です。")
+
+    if len(all_trades) > 0:
+        df_trades = pd.DataFrame(all_trades)
+        t_col1, t_col2 = st.columns(2)
+
+        for st_name, col_obj in [("CORE (順張り)", t_col1), ("TCO (暴落迎撃)", t_col2)]:
+            sub = df_trades[df_trades["strategy"] == st_name]
+            with col_obj:
+                st.markdown(f"#### 🏛️ {st_name}")
+                if len(sub) > 0:
+                    win_sub = sub[sub["weighted_pnl"] > 0]
+                    w_rate = len(win_sub) / len(sub) * 100.0
+                    sum_w = sub[sub["weighted_pnl"] > 0]["weighted_pnl"].sum()
+                    sum_l = abs(sub[sub["weighted_pnl"] < 0]["weighted_pnl"].sum())
+                    s_pf = (sum_w / sum_l) if sum_l > EPSILON else (99.0 if sum_w > 0 else 0.0)
+                    avg_h = sub["holding_days"].mean()
+                    tot_contrib = sub["weighted_pnl"].sum() * 100.0
+
+                    sm1, sm2, sm3, sm4 = st.columns(4)
+                    sm1.metric("トレード数", f"{len(sub)} 件")
+                    sm2.metric("勝率 / PF", f"{w_rate:.1f}% / {s_pf:.2f}")
+                    sm3.metric("累積PF貢献", f"{tot_contrib:+.1f}%")
+                    sm4.metric("平均保有日数", f"{avg_h:.1f} 日")
+                else:
+                    st.info(f"{st_name} の完結トレードはありません。")
+
+        st.markdown("---")
+        diag_c1, diag_c2 = st.columns(2)
+        tco_only = df_trades[df_trades["strategy"] == "TCO (暴落迎撃)"]
+
+        with diag_c1:
+            st.markdown("#### 🎯 TCO 決済理由別パフォーマンス内訳")
+            if len(tco_only) > 0:
+                reason_rows = []
+                for r_name, r_grp in tco_only.groupby("exit_reason"):
+                    rw = (r_grp["weighted_pnl"] > 0).mean() * 100.0
+                    sw = r_grp[r_grp["weighted_pnl"] > 0]["weighted_pnl"].sum()
+                    sl = abs(r_grp[r_grp["weighted_pnl"] < 0]["weighted_pnl"].sum())
+                    r_pf = (sw / sl) if sl > EPSILON else (99.0 if sw > 0 else 0.0)
+                    reason_rows.append({
+                        "決済理由": r_name,
+                        "件数": len(r_grp),
+                        "勝率": f"{rw:.1f}%",
+                        "平均単体損益": f"{r_grp['pnl_pct'].mean():+.2f}%",
+                        "累積PF貢献": f"{r_grp['weighted_pnl'].sum()*100:+.2f}%",
+                        "PF": f"{r_pf:.2f}"
+                    })
+                st.dataframe(pd.DataFrame(reason_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("TCOトレードなし")
+
+        with diag_c2:
+            st.markdown("#### 📊 TCO 銘柄別スナイパー成績")
+            if len(tco_only) > 0:
+                asset_rows = []
+                for a_name, a_grp in tco_only.groupby("asset"):
+                    aw = (a_grp["weighted_pnl"] > 0).mean() * 100.0
+                    sw = a_grp[a_grp["weighted_pnl"] > 0]["weighted_pnl"].sum()
+                    sl = abs(a_grp[a_grp["weighted_pnl"] < 0]["weighted_pnl"].sum())
+                    a_pf = (sw / sl) if sl > EPSILON else (99.0 if sw > 0 else 0.0)
+                    asset_rows.append({
+                        "銘柄": a_name,
+                        "件数": len(a_grp),
+                        "勝率": f"{aw:.1f}%",
+                        "平均保有": f"{a_grp['holding_days'].mean():.1f}日",
+                        "累積PF貢献": f"{a_grp['weighted_pnl'].sum()*100:+.2f}%",
+                        "PF": f"{a_pf:.2f}"
+                    })
+                st.dataframe(pd.DataFrame(asset_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("TCOトレードなし")
+
+        st.markdown("---")
+        df_disp = df_trades.copy()
+        df_disp["entry_date"] = pd.to_datetime(df_disp["entry_date"]).dt.strftime('%Y-%m-%d')
+        df_disp["exit_date"] = pd.to_datetime(df_disp["exit_date"]).dt.strftime('%Y-%m-%d')
+        df_disp["pnl_pct_str"] = df_disp["pnl_pct"].apply(lambda x: f"{x:+.2f} %")
+        df_disp["weighted_pnl_str"] = df_disp["weighted_pnl"].apply(lambda x: f"{x*100:+.2f} %")
+        df_disp["weight_str"] = df_disp["weight"].apply(lambda x: f"{x*100:.1f} %")
+
+        st.dataframe(
+            df_disp[["strategy", "asset", "entry_date", "exit_date", "weight_str", "holding_days", "pnl_pct_str", "weighted_pnl_str", "exit_reason"]].rename(columns={
+                "strategy": "戦略種別", "asset": "銘柄", "entry_date": "買付日", "exit_date": "売却日",
+                "weight_str": "投入配分", "holding_days": "保有日数",
+                "pnl_pct_str": "単体純損益 (%)", "weighted_pnl_str": "PF貢献損益 (%)", "exit_reason": "決済理由"
+            }),
+            use_container_width=True, height=400, hide_index=True
+        )
+    else:
+        st.info("集計対象の完結トレードがありません。")
+
+# -------------------------------------------------------------
+# TAB 4: Purged Walk-Forward (OOS) 検証
+# -------------------------------------------------------------
+with tab4:
+    st.subheader("🔄 Purged Walk-Forward (完全Out-of-Sample) 検証")
+    st.caption("3年学習・5日Embargo・1年完全未学習OOSテストを逐次連結した実績推移です。")
+
+    wf_train_days = 252 * 3
+    wf_test_days = 252 * 1
+    total_len = len(strat_ret)
+
+    if total_len > wf_train_days + wf_test_days:
+        oos_rets, oos_dates, oos_splits = [], [], []
+        step = wf_test_days
+
+        for start in range(0, total_len - wf_train_days - wf_test_days + 1, step):
+            test_start = start + wf_train_days
+            test_end = test_start + wf_test_days
+            seg = strat_ret[test_start:test_end]
+            oos_rets.extend(seg)
+            oos_dates.extend(eval_idx[test_start:test_end])
+
+            seg_cum = np.cumprod(1.0 + seg)
+            seg_ret = (seg_cum[-1] - 1.0) * 100.0
+            seg_peaks = np.maximum.accumulate(seg_cum)
+            seg_dd = np.min((seg_cum - seg_peaks) / np.maximum(seg_peaks, EPSILON)) * 100.0
+            oos_splits.append({
+                "検証期間": f"{eval_idx[test_start].strftime('%Y/%m')} - {eval_idx[test_end-1].strftime('%Y/%m')}",
+                "OOS 累積リターン": f"{seg_ret:+.1f} %",
+                "OOS MDD": f"{seg_dd:.1f} %"
+            })
+
+        cum_oos = np.cumprod(1.0 + np.array(oos_rets))
+        years_oos = max(len(oos_rets) / TRADING_DAYS_PER_YEAR, 0.1)
+        oos_cagr = (cum_oos[-1] ** (1.0 / years_oos)) - 1.0
+
+        w_col1, w_col2 = st.columns([2, 1])
+        with w_col1:
+            fig_wf = go.Figure()
+            fig_wf.add_trace(go.Scatter(x=oos_dates, y=cum_oos, name="厳密OOS 連結資産成長", line=dict(color="#e67e22", width=2)))
+            fig_wf.update_layout(title="完全未学習期間 (OOS) 累積パフォーマンス", height=380, margin=dict(t=40, b=20, l=10, r=10))
+            fig_wf.update_yaxes(type="log")
+            st.plotly_chart(fig_wf, use_container_width=True)
+        with w_col2:
+            st.markdown("#### 🏆 厳密OOS 通算実績")
+            st.metric("OOS 通算 CAGR", f"{oos_cagr*100:.1f}%")
+            st.dataframe(pd.DataFrame(oos_splits), use_container_width=True, hide_index=True)
+
+# -------------------------------------------------------------
+# TAB 5: Block Bootstrap モンテカルロ
+# -------------------------------------------------------------
+with tab5:
+    st.subheader("🎲 Circular Block Bootstrap (ボラティリティ連鎖保持)")
+    st.caption("10営業日のブロック単位でリサンプリングし、テールリスクを再現したファンチャートです。")
+
+    block_size = 10
+    n_sims = 500
+    n_steps = min(252 * 5, len(strat_ret))
+    base_r = strat_ret[-n_steps:]
+    n_base = len(base_r)
+
+    np.random.seed(42)
+    n_blocks = int(np.ceil(n_steps / block_size))
+    rand_starts = np.random.randint(0, n_base, size=(n_sims, n_blocks))
+    offsets = np.arange(block_size)
+    sampled_indices = (rand_starts[:, :, None] + offsets[None, None, :]).reshape(n_sims, -1)[:, :n_steps] % n_base
+    resampled_returns = base_r[sampled_indices]
+    sim_paths = np.cumprod(1.0 + resampled_returns, axis=1)
+
+    p5 = np.percentile(sim_paths, 5, axis=0)
+    p25 = np.percentile(sim_paths, 25, axis=0)
+    p50 = np.percentile(sim_paths, 50, axis=0)
+    p75 = np.percentile(sim_paths, 75, axis=0)
+    p95 = np.percentile(sim_paths, 95, axis=0)
+    step_axis = np.arange(1, n_steps + 1)
+
+    mc_c1, mc_c2 = st.columns([2, 1])
+    with mc_c1:
+        fig_mc = go.Figure()
+        fig_mc.add_trace(go.Scatter(x=step_axis, y=p95, name="95% 楽観ケース", line=dict(color="rgba(46, 204, 113, 0.4)")))
+        fig_mc.add_trace(go.Scatter(x=step_axis, y=p75, name="75% タイル", line=dict(color="rgba(52, 152, 219, 0.5)")))
+        fig_mc.add_trace(go.Scatter(x=step_axis, y=p50, name="中央値 (Median)", line=dict(color="#f39c12", width=2.5)))
+        fig_mc.add_trace(go.Scatter(x=step_axis, y=p25, name="25% タイル", line=dict(color="rgba(231, 76, 60, 0.5)")))
+        fig_mc.add_trace(go.Scatter(x=step_axis, y=p5, name="5% 悲観ケース", line=dict(color="rgba(192, 57, 43, 0.4)")))
+        fig_mc.update_layout(title="今後5年間の期待資産分布 (Block Bootstrap 500試行)", xaxis_title="営業日数", yaxis_title="資産倍率", height=400, margin=dict(t=40, b=20, l=10, r=10))
+        st.plotly_chart(fig_mc, use_container_width=True)
+
+    with mc_c2:
+        st.markdown("#### ⚡ 取引摩擦ストレステスト")
+        stress_list = []
+        for test_bps in [0, 10, 20, 30, 50]:
+            r_st, _, _, _, _ = run_hybrid_backtest(
+                core_target_alloc, tco_target_alloc, o_etf_matrix, fx_array,
+                test_bps/10000.0, max(test_bps*2, 30)/10000.0, use_dd_controller, use_jpy,
+                rebalance_buffer, common_idx, tco_exit_map
+            )
+            c_st = (np.cumprod(1.0 + r_st)[-1] ** (1.0 / max(len(r_st)/252, 0.1))) - 1.0
+            stress_list.append({
+                "片道コスト": f"{test_bps} bps", "CAGR": f"{c_st*100:.1f}%", "劣化幅": f"{(c_st - metrics_strat['CAGR'])*100:+.1f}%"
+            })
+        st.dataframe(pd.DataFrame(stress_list), use_container_width=True, hide_index=True)
+
+# -------------------------------------------------------------
+# TAB 6: 3目的 Pareto Frontier 探索
+# -------------------------------------------------------------
+with tab6:
+    st.subheader("💎 3目的 Pareto Frontier (収益 vs MDD vs CVaR) 探索")
+
+    if "pareto_df" not in st.session_state:
+        st.session_state.pareto_df = None
+
+    if st.button("🚀 パレート探索を実行 (TCO v3.0 ハイブリッド グリッドスキャン)"):
+        with st.spinner("パラメータ空間を高速走査中..."):
+            grid_results = []
+            for scan_vol in [0.30, 0.40, 0.50]:
+                for scan_tco in [0.0, 0.20, 0.30]:
+                    s_core, s_tco, s_comb, _, s_exit_map = generate_hybrid_allocations(
+                        signals, market_data, common_idx, max_cap, roll_cov_matrix, scan_vol,
+                        False, (scan_tco > 0), scan_tco, tco_top_k,
+                        tco_entry_mode, capital_sweep_mode, tco_risk_budget, tco_max_hold
+                    )
+                    r_sc, eff_w_sc, _, tr_sc, _ = run_hybrid_backtest(
+                        s_core, s_tco, o_etf_matrix, fx_array, fee_rate, tco_fee_rate,
+                        use_dd_controller, use_jpy, rebalance_buffer, common_idx, s_exit_map
+                    )
+                    m_sc = evaluate_performance(r_sc, eff_w_sc, tr_sc)
+                    grid_results.append({
+                        "TargetVol": f"{int(scan_vol*100)}%",
+                        "TCO_Cap": f"{int(scan_tco*100)}%",
+                        "設定ラベル": f"Vol {int(scan_vol*100)}% / 迎撃枠 {int(scan_tco*100)}%",
+                        "CAGR": m_sc["CAGR"] * 100.0,
+                        "MDD": abs(m_sc["MDD"] * 100.0),
+                        "CVaR_95": abs(m_sc["CVaR_95"] * 100.0),
+                        "Calmar": m_sc["Calmar"]
+                    })
+
+            st.session_state.pareto_df = pd.DataFrame(grid_results)
+
+    if st.session_state.pareto_df is not None:
+        df_grid = st.session_state.pareto_df
+
+        best_balanced = df_grid.loc[df_grid["Calmar"].idxmax()]
+        best_safe = df_grid.loc[df_grid["MDD"].idxmin()]
+        best_growth = df_grid.loc[df_grid["CAGR"].idxmax()]
+
+        st.markdown("### 🏆 目的別・推奨おすすめ3大設定")
+        col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            st.success(
+                f"**① 総合バランス最優秀 (Calmar最大)**\n\n"
+                f"**【{best_balanced['設定ラベル']}】**\n\n"
+                f"* CAGR: **{best_balanced['CAGR']:.1f}%**\n"
+                f"* MDD: **-{best_balanced['MDD']:.1f}%**\n"
+                f"* Calmar比率: **{best_balanced['Calmar']:.2f}**"
+            )
+        with col_b2:
+            st.info(
+                f"**② 最も安全重視 (下落最小)**\n\n"
+                f"**【{best_safe['設定ラベル']}】**\n\n"
+                f"* CAGR: **{best_safe['CAGR']:.1f}%**\n"
+                f"* MDD: **-{best_safe['MDD']:.1f}%**\n"
+                f"* Calmar比率: **{best_safe['Calmar']:.2f}**"
+            )
+        with col_b3:
+            st.warning(
+                f"**③ 最も収益重視 (リターン最大)**\n\n"
+                f"**【{best_growth['設定ラベル']}】**\n\n"
+                f"* CAGR: **{best_growth['CAGR']:.1f}%**\n"
+                f"* MDD: **-{best_growth['MDD']:.1f}%**\n"
+                f"* Calmar比率: **{best_growth['Calmar']:.2f}**"
+            )
+
+        fig_pareto = go.Figure()
+        fig_pareto.add_trace(go.Scatter(
+            x=df_grid["MDD"],
+            y=df_grid["CAGR"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(df_grid["Calmar"] * 9, 12, 36),
+                color=df_grid["CVaR_95"],
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="日次CVaR (%)"),
+                line=dict(width=1, color="black")
+            ),
+            text=df_grid["設定ラベル"],
+            customdata=np.stack((df_grid["Calmar"], df_grid["CVaR_95"]), axis=-1),
+            hovertemplate=(
+                "<b>%{text}</b><br><br>"
+                "年平均リターン (CAGR): %{y:.1f}%<br>"
+                "最大下落率 (MDD): -%{x:.1f}%<br>"
+                "Calmar比率: %{customdata[0]:.2f}<br>"
+                "日次95% CVaR: %{customdata[1]:.2f}%<extra></extra>"
+            )
+        ))
+
+        fig_pareto.update_layout(
+            title="Pareto 最適空間 (左上ほど優秀 ｜ 丸サイズ: Calmar比率)",
+            xaxis_title="最大ドローダウン MDD (%) [← 左ほど下落が小さく安全]",
+            yaxis_title="通算 CAGR (%) [↑ 上ほど収益が高い]",
+            height=520,
+            hovermode="closest"
+        )
+        st.plotly_chart(fig_pareto, use_container_width=True)
